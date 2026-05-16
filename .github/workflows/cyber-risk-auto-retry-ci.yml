@@ -1,0 +1,49 @@
+name: cyber-risk-auto-retry-ci
+
+on:
+  push:
+    branches:
+      - cyber-risk-auto-retry
+      - cyber-risk-auto-retry-full-ci
+  workflow_dispatch:
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  rust-checks:
+    name: Rust compile and targeted tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26
+        with:
+          toolchain: 1.93.0
+          components: rustfmt
+      - name: cargo fmt check
+        run: cargo fmt -- --config imports_granularity=Item --check 2>&1 | tee ../cargo-fmt.log
+      - name: Compile codex-core tests
+        run: cargo test -p codex-core --test suite --no-run 2>&1 | tee ../codex-core-test-compile.log
+      - name: Run core safety_check_downgrade tests
+        run: cargo test -p codex-core --test suite safety_check_downgrade -- --nocapture 2>&1 | tee ../codex-core-safety-test.log
+      - name: Compile app-server tests
+        run: cargo test -p codex-app-server --test suite --no-run 2>&1 | tee ../app-server-test-compile.log
+      - name: Run app-server safety_check_downgrade tests
+        run: cargo test -p codex-app-server --test suite safety_check_downgrade -- --nocapture 2>&1 | tee ../app-server-safety-test.log
+      - name: Upload compile and test logs
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        if: always()
+        with:
+          name: cyber-risk-auto-retry-ci-results
+          path: |
+            cargo-fmt.log
+            codex-core-test-compile.log
+            codex-core-safety-test.log
+            app-server-test-compile.log
+            app-server-safety-test.log
