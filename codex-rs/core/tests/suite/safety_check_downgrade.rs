@@ -5,7 +5,6 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ModelRerouteReason;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
@@ -29,6 +28,7 @@ use wiremock::ResponseTemplate;
 
 const SERVER_MODEL: &str = "gpt-5.2";
 const REQUESTED_MODEL: &str = "gpt-5.3-codex";
+const DIRECT_CYBER_POLICY_FALLBACK_MODEL: &str = "gpt-5.2";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
 const CYBER_POLICY_MESSAGE: &str =
@@ -58,14 +58,35 @@ fn disabled_text_turn(test: &TestCodex, text: &str) -> Op {
     }
 }
 
+async fn assert_no_error_reroute_or_warning_until_turn_complete(test: &TestCodex) {
+    loop {
+        let event = wait_for_event(&test.codex, |_| true).await;
+        match event {
+            EventMsg::Error(error) => panic!("unexpected error event: {error:?}"),
+            EventMsg::ModelReroute(reroute) => {
+                panic!("unexpected model reroute event: {reroute:?}")
+            }
+            EventMsg::Warning(warning) => panic!("unexpected warning event: {warning:?}"),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn openai_model_header_mismatch_emits_warning_event() -> Result<()> {
+async fn openai_model_header_mismatch_retries_on_server_model_without_warning() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let response =
+    let first_response =
         sse_response(sse_completed("resp-1")).insert_header("OpenAI-Model", SERVER_MODEL);
-    let _mock = mount_response_once(&server, response).await;
+    let second_response = sse_response(sse(vec![
+        ev_response_created("resp-2"),
+        ev_assistant_message("msg-1", "done"),
+        core_test_support::responses::ev_completed("resp-2"),
+    ]))
+    .insert_header("OpenAI-Model", SERVER_MODEL);
+    let mock = mount_response_sequence(&server, vec![first_response, second_response]).await;
 
     let mut builder = test_codex().with_model(REQUESTED_MODEL);
     let test = builder.build(&server).await?;
@@ -74,38 +95,27 @@ async fn openai_model_header_mismatch_emits_warning_event() -> Result<()> {
         .submit(disabled_text_turn(&test, "trigger safety check"))
         .await?;
 
-    let reroute = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::ModelReroute(_))
-    })
-    .await;
-    let EventMsg::ModelReroute(reroute) = reroute else {
-        panic!("expected model reroute event");
-    };
-    assert_eq!(reroute.from_model, REQUESTED_MODEL);
-    assert_eq!(reroute.to_model, SERVER_MODEL);
-    assert_eq!(reroute.reason, ModelRerouteReason::HighRiskCyberActivity);
-
-    let warning = wait_for_event(&test.codex, |event| matches!(event, EventMsg::Warning(_))).await;
-    let EventMsg::Warning(warning) = warning else {
-        panic!("expected warning event");
-    };
-    assert!(warning.message.contains(REQUESTED_MODEL));
-    assert!(warning.message.contains(SERVER_MODEL));
-
-    let _ = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
+    assert_no_error_reroute_or_warning_until_turn_complete(&test).await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].body_json()["model"].as_str(),
+        Some(REQUESTED_MODEL)
+    );
+    assert_eq!(
+        requests[1].body_json()["model"].as_str(),
+        Some(SERVER_MODEL)
+    );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cyber_policy_response_emits_typed_error_without_retry() -> Result<()> {
+async fn cyber_policy_response_retries_with_default_fallback_without_error() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let response = ResponseTemplate::new(400).set_body_json(serde_json::json!({
+    let first_response = ResponseTemplate::new(400).set_body_json(serde_json::json!({
         "error": {
             "message": CYBER_POLICY_MESSAGE,
             "type": "invalid_request",
@@ -113,7 +123,12 @@ async fn cyber_policy_response_emits_typed_error_without_retry() -> Result<()> {
             "code": "cyber_policy"
         }
     }));
-    let mock = mount_response_once(&server, response).await;
+    let second_response = sse_response(sse(vec![
+        ev_response_created("resp-2"),
+        ev_assistant_message("msg-1", "done"),
+        core_test_support::responses::ev_completed("resp-2"),
+    ]));
+    let mock = mount_response_sequence(&server, vec![first_response, second_response]).await;
 
     let mut builder = test_codex().with_model(REQUESTED_MODEL);
     let test = builder.build(&server).await?;
@@ -122,24 +137,28 @@ async fn cyber_policy_response_emits_typed_error_without_retry() -> Result<()> {
         .submit(disabled_text_turn(&test, "trigger cyber policy error"))
         .await?;
 
-    let error = wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
-    let EventMsg::Error(error) = error else {
-        panic!("expected error event");
-    };
-    assert_eq!(error.message, CYBER_POLICY_MESSAGE);
-    assert_eq!(error.codex_error_info, Some(CodexErrorInfo::CyberPolicy));
-
-    mock.single_request();
+    assert_no_error_reroute_or_warning_until_turn_complete(&test).await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].body_json()["model"].as_str(),
+        Some(REQUESTED_MODEL)
+    );
+    assert_eq!(
+        requests[1].body_json()["model"].as_str(),
+        Some(DIRECT_CYBER_POLICY_FALLBACK_MODEL)
+    );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn response_model_field_mismatch_emits_warning_when_header_matches_requested() -> Result<()> {
+async fn response_model_field_mismatch_retries_without_warning_when_header_matches_requested()
+-> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let response = sse_response(sse(vec![
+    let first_response = sse_response(sse(vec![
         serde_json::json!({
             "type": "response.created",
             "response": {
@@ -152,7 +171,13 @@ async fn response_model_field_mismatch_emits_warning_when_header_matches_request
         core_test_support::responses::ev_completed("resp-1"),
     ]))
     .insert_header("OpenAI-Model", REQUESTED_MODEL);
-    let _mock = mount_response_once(&server, response).await;
+    let second_response = sse_response(sse(vec![
+        ev_response_created("resp-2"),
+        ev_assistant_message("msg-1", "done"),
+        core_test_support::responses::ev_completed("resp-2"),
+    ]))
+    .insert_header("OpenAI-Model", SERVER_MODEL);
+    let mock = mount_response_sequence(&server, vec![first_response, second_response]).await;
 
     let mut builder = test_codex().with_model(REQUESTED_MODEL);
     let test = builder.build(&server).await?;
@@ -161,43 +186,23 @@ async fn response_model_field_mismatch_emits_warning_when_header_matches_request
         .submit(disabled_text_turn(&test, "trigger response model check"))
         .await?;
 
-    let reroute = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::ModelReroute(_))
-    })
-    .await;
-    let EventMsg::ModelReroute(reroute) = reroute else {
-        panic!("expected model reroute event");
-    };
-    assert_eq!(reroute.from_model, REQUESTED_MODEL);
-    assert_eq!(reroute.to_model, SERVER_MODEL);
-    assert_eq!(reroute.reason, ModelRerouteReason::HighRiskCyberActivity);
-
-    let warning = wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::Warning(warning)
-                if warning
-                    .message
-                    .contains("flagged for potentially high-risk cyber activity")
-        )
-    })
-    .await;
-    let EventMsg::Warning(warning) = warning else {
-        panic!("expected warning event");
-    };
-    assert!(warning.message.contains(REQUESTED_MODEL));
-    assert!(warning.message.contains(SERVER_MODEL));
-
-    let _ = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
+    assert_no_error_reroute_or_warning_until_turn_complete(&test).await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].body_json()["model"].as_str(),
+        Some(REQUESTED_MODEL)
+    );
+    assert_eq!(
+        requests[1].body_json()["model"].as_str(),
+        Some(SERVER_MODEL)
+    );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Result<()> {
+async fn openai_model_header_mismatch_retry_does_not_record_failed_response_items() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -222,7 +227,7 @@ async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Resul
         core_test_support::responses::ev_completed("resp-2"),
     ]))
     .insert_header("OpenAI-Model", SERVER_MODEL);
-    let _mock = mount_response_sequence(&server, vec![first_response, second_response]).await;
+    let mock = mount_response_sequence(&server, vec![first_response, second_response]).await;
 
     let mut builder = test_codex().with_model(REQUESTED_MODEL);
     let test = builder.build(&server).await?;
@@ -231,19 +236,69 @@ async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Resul
         .submit(disabled_text_turn(&test, "trigger follow-up turn"))
         .await?;
 
+    assert_no_error_reroute_or_warning_until_turn_complete(&test).await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(mock.function_call_output_text("call-1").is_none());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cyber_policy_response_emits_typed_error_after_retry_budget_exhausted() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let cyber_response = || {
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {
+                "message": CYBER_POLICY_MESSAGE,
+                "type": "invalid_request",
+                "param": null,
+                "code": "cyber_policy"
+            }
+        }))
+    };
+    let mock = mount_response_sequence(&server, vec![cyber_response(), cyber_response()]).await;
+
+    let mut builder = test_codex().with_model(REQUESTED_MODEL);
+    let test = builder.build(&server).await?;
+
+    test.codex
+        .submit(disabled_text_turn(
+            &test,
+            "trigger repeated cyber policy error",
+        ))
+        .await?;
+
+    let mut reroute_count = 0;
     let mut warning_count = 0;
     loop {
         let event = wait_for_event(&test.codex, |_| true).await;
         match event {
-            EventMsg::Warning(warning) if warning.message.contains(REQUESTED_MODEL) => {
-                warning_count += 1;
+            EventMsg::ModelReroute(_) => reroute_count += 1,
+            EventMsg::Warning(_) => warning_count += 1,
+            EventMsg::Error(error) => {
+                assert_eq!(error.message, CYBER_POLICY_MESSAGE);
+                assert_eq!(error.codex_error_info, Some(CodexErrorInfo::CyberPolicy));
+                break;
             }
-            EventMsg::TurnComplete(_) => break,
             _ => {}
         }
     }
 
-    assert_eq!(warning_count, 1);
+    assert_eq!(reroute_count, 0);
+    assert_eq!(warning_count, 0);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].body_json()["model"].as_str(),
+        Some(REQUESTED_MODEL)
+    );
+    assert_eq!(
+        requests[1].body_json()["model"].as_str(),
+        Some(DIRECT_CYBER_POLICY_FALLBACK_MODEL)
+    );
 
     Ok(())
 }
