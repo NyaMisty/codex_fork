@@ -28,8 +28,10 @@ jobs:
         include:
           # macOS
           - os: macos-15-xlarge
+            runs_on: macos-15
             target: aarch64-apple-darwin
           - os: macos-15-xlarge
+            runs_on: macos-15
             target: x86_64-apple-darwin
 
           # Linux
@@ -44,7 +46,7 @@ jobs:
           # - os: ubuntu-24.04-arm
           #   target: aarch64-unknown-linux-gnu
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runs_on || matrix.os }}
 
     # Configure a human readable name for each job
     name: Bazel test on ${{ matrix.os }} for ${{ matrix.target }}
@@ -172,7 +174,10 @@ jobs:
 
           bazel_test_query='tests(//...) except tests(//third_party/v8:all) except //codex-rs/code-mode:code-mode-unit-tests except //codex-rs/v8-poc:v8-poc-unit-tests except attr(tags, "manual", tests(//...))'
           mapfile -t bazel_targets < <(
-            MSYS2_ARG_CONV_EXCL='*' bazel query --output=label "${bazel_test_query}" \
+            ./.github/scripts/run-bazel-query-ci.sh \
+              --windows-cross-compile \
+              --output=label \
+              -- "${bazel_test_query}" \
               | LC_ALL=C sort
           )
 
@@ -329,10 +334,11 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - os: macos-15-xlarge
+            runs_on: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-gnullvm
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Bazel clippy on ${{ matrix.os }} for ${{ matrix.target }}
 
     steps:
@@ -419,10 +425,11 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - os: macos-15-xlarge
+            runs_on: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-gnullvm
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Verify release build on ${{ matrix.os }} for ${{ matrix.target }}
 
     steps:

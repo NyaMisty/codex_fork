@@ -65,6 +65,13 @@ if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
     "--config=${ci_config}"
     "--remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
   )
+else
+  bazel_query_args+=(
+    --bes_backend=
+    --experimental_remote_downloader=
+    --remote_cache=
+    --remote_executor=
+  )
 fi
 
 if [[ -n "${BAZEL_REPO_CONTENTS_CACHE:-}" ]]; then
