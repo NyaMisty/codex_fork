@@ -69,9 +69,7 @@ async fn openai_model_header_mismatch_retries_on_server_model_without_warning_v2
         mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
     )
     .await??;
-    let ThreadStartResponse {
-        thread, ..
-    } = to_response::<ThreadStartResponse>(thread_resp)?;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
 
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
@@ -146,9 +144,7 @@ async fn cyber_policy_response_retries_with_default_fallback_without_error_v2() 
         mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
     )
     .await??;
-    let ThreadStartResponse {
-        thread, ..
-    } = to_response::<ThreadStartResponse>(thread_resp)?;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
 
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
