@@ -27,15 +27,15 @@ jobs:
           toolchain: 1.93.0
           components: rustfmt
       - name: cargo fmt check
-        run: cargo fmt -- --config imports_granularity=Item --check 2>&1 | tee ../cargo-fmt.log
+        run: set -o pipefail; cargo fmt -- --config imports_granularity=Item --check 2>&1 | tee ../cargo-fmt.log
       - name: Compile codex-core tests
-        run: cargo test -p codex-core --test suite --no-run 2>&1 | tee ../codex-core-test-compile.log
+        run: set -o pipefail; cargo test -p codex-core --test all --no-run 2>&1 | tee ../codex-core-test-compile.log
       - name: Run core safety_check_downgrade tests
-        run: cargo test -p codex-core --test suite safety_check_downgrade -- --nocapture 2>&1 | tee ../codex-core-safety-test.log
+        run: set -o pipefail; cargo test -p codex-core --test all safety_check_downgrade -- --nocapture 2>&1 | tee ../codex-core-safety-test.log
       - name: Compile app-server tests
-        run: cargo test -p codex-app-server --test suite --no-run 2>&1 | tee ../app-server-test-compile.log
+        run: set -o pipefail; cargo test -p codex-app-server --test all --no-run 2>&1 | tee ../app-server-test-compile.log
       - name: Run app-server safety_check_downgrade tests
-        run: cargo test -p codex-app-server --test suite safety_check_downgrade -- --nocapture 2>&1 | tee ../app-server-safety-test.log
+        run: set -o pipefail; cargo test -p codex-app-server --test all safety_check_downgrade -- --nocapture 2>&1 | tee ../app-server-safety-test.log
       - name: Upload compile and test logs
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         if: always()
