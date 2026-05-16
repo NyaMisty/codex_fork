@@ -13,29 +13,39 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Check whether Bazel-backed lint should run
+      id: bazel_lint_gate
+      env:
+        BUILDBUDDY_API_KEY: ${{ inputs.buildbuddy-api-key }}
+      shell: bash
+      run: |
+        if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "Skipping Bazel-backed argument-comment-lint without BuildBuddy credentials; fork PRs use cargo-native CI plus the binary build artifact."
+        echo "run=false" >> "$GITHUB_OUTPUT"
+
     - uses: ./.github/actions/setup-bazel-ci
+      if: ${{ steps.bazel_lint_gate.outputs.run == 'true' }}
       with:
         target: ${{ inputs.target }}
         install-test-prereqs: true
 
     - name: Install Linux sandbox build dependencies
-      if: ${{ runner.os == 'Linux' }}
+      if: ${{ steps.bazel_lint_gate.outputs.run == 'true' && runner.os == 'Linux' }}
       shell: bash
       run: |
         sudo DEBIAN_FRONTEND=noninteractive apt-get update
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
 
     - name: Run argument comment lint on codex-rs via Bazel
-      if: ${{ runner.os != 'Windows' }}
+      if: ${{ steps.bazel_lint_gate.outputs.run == 'true' && runner.os != 'Windows' }}
       env:
         BUILDBUDDY_API_KEY: ${{ inputs.buildbuddy-api-key }}
       shell: bash
       run: |
-        if [[ "${RUNNER_OS}" == "macOS" && -z "${BUILDBUDDY_API_KEY:-}" ]]; then
-          echo "Skipping macOS argument-comment-lint without BuildBuddy credentials; local fallback cannot fetch the Apple CLTools SDK in fork PRs."
-          exit 0
-        fi
-
         bazel_targets="$(./tools/argument-comment-lint/list-bazel-targets.sh)"
         ./.github/scripts/run-bazel-ci.sh \
           -- \
@@ -47,7 +57,7 @@ runs:
           ${bazel_targets}
 
     - name: Run argument comment lint on codex-rs via Bazel
-      if: ${{ runner.os == 'Windows' }}
+      if: ${{ steps.bazel_lint_gate.outputs.run == 'true' && runner.os == 'Windows' }}
       env:
         BUILDBUDDY_API_KEY: ${{ inputs.buildbuddy-api-key }}
       shell: bash
