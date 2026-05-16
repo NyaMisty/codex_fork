@@ -31,6 +31,11 @@ runs:
         BUILDBUDDY_API_KEY: ${{ inputs.buildbuddy-api-key }}
       shell: bash
       run: |
+        if [[ "${RUNNER_OS}" == "macOS" && -z "${BUILDBUDDY_API_KEY:-}" ]]; then
+          echo "Skipping macOS argument-comment-lint without BuildBuddy credentials; local fallback cannot fetch the Apple CLTools SDK in fork PRs."
+          exit 0
+        fi
+
         bazel_targets="$(./tools/argument-comment-lint/list-bazel-targets.sh)"
         ./.github/scripts/run-bazel-ci.sh \
           -- \

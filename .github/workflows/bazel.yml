@@ -81,6 +81,11 @@ jobs:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
         run: |
+          if [[ "${RUNNER_OS}" == "macOS" && -z "${BUILDBUDDY_API_KEY:-}" ]]; then
+            echo "Skipping macOS Bazel test without BuildBuddy credentials; local fallback cannot fetch the Apple CLTools SDK in fork PRs."
+            exit 0
+          fi
+
           bazel_targets=(
             //...
             # Keep standalone V8 library targets out of the ordinary Bazel CI
@@ -359,6 +364,11 @@ jobs:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
         run: |
+          if [[ "${RUNNER_OS}" == "macOS" && -z "${BUILDBUDDY_API_KEY:-}" ]]; then
+            echo "Skipping macOS Bazel clippy without BuildBuddy credentials; local fallback cannot fetch the Apple CLTools SDK in fork PRs."
+            exit 0
+          fi
+
           bazel_clippy_args=(
             --config=clippy
             --build_metadata=COMMIT_SHA=${GITHUB_SHA}
@@ -450,6 +460,11 @@ jobs:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
         run: |
+          if [[ "${RUNNER_OS}" == "macOS" && -z "${BUILDBUDDY_API_KEY:-}" ]]; then
+            echo "Skipping macOS Bazel release verification without BuildBuddy credentials; local fallback cannot fetch the Apple CLTools SDK in fork PRs."
+            exit 0
+          fi
+
           # This job exists to compile Rust code behind
           # `cfg(not(debug_assertions))` so PR CI catches failures that would
           # otherwise show up only in a release build. We do not need the full
