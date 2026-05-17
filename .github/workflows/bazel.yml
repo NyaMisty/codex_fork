@@ -292,8 +292,8 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
-      - name: Check whether Bazel clippy should run
-        id: bazel_clippy_gate
+      - name: Check whether native Windows Bazel test should run
+        id: bazel_test_gate
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
@@ -303,11 +303,11 @@ jobs:
             exit 0
           fi
 
-          echo "Skipping Bazel clippy without BuildBuddy credentials; fork PRs use cargo-native CI plus the binary build artifact."
+          echo "Skipping native Windows Bazel test without BuildBuddy credentials; fork PRs use cargo-native CI plus the binary build artifact."
           echo "run=false" >> "$GITHUB_OUTPUT"
 
       - name: Prepare Bazel CI
-        if: ${{ steps.bazel_clippy_gate.outputs.run == 'true' }}
+        if: ${{ steps.bazel_test_gate.outputs.run == 'true' }}
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
@@ -316,6 +316,7 @@ jobs:
           install-test-prereqs: "true"
 
       - name: bazel test //...
+        if: ${{ steps.bazel_test_gate.outputs.run == 'true' }}
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
@@ -350,7 +351,7 @@ jobs:
             "${bazel_targets[@]}"
 
       - name: Upload Bazel execution logs
-        if: always() && !cancelled()
+        if: ${{ always() && !cancelled() && steps.bazel_test_gate.outputs.run == 'true' }}
         continue-on-error: true
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -361,7 +362,7 @@ jobs:
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
       - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        if: ${{ always() && !cancelled() && steps.bazel_test_gate.outputs.run == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
@@ -394,7 +395,22 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - name: Check whether Bazel clippy should run
+        id: bazel_clippy_gate
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Skipping Bazel clippy without BuildBuddy credentials; fork PRs use cargo-native CI plus the binary build artifact."
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
       - name: Prepare Bazel CI
+        if: ${{ steps.bazel_clippy_gate.outputs.run == 'true' }}
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
