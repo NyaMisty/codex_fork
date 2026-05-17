@@ -665,7 +665,26 @@ jobs:
 
       - name: tests
         id: test
-        run: cargo nextest run --no-fail-fast --target ${{ matrix.target }} --cargo-profile ci-test --timings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nextest_args=(
+            cargo nextest run
+            --no-fail-fast
+            --target "${{ matrix.target }}"
+            --cargo-profile ci-test
+            --timings
+          )
+
+          if [[ '${{ matrix.remote_env }}' == 'true' ]]; then
+            nextest_args+=(
+              -E
+              'package(codex-core) & (test(/^suite::(agents_md|hierarchical_agents|remote_env|skills)::/) | test(/^suite::view_image::view_image_routes_to_selected_remote_environment$/) | test(/^suite::rmcp_client::(remote_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd|remote_stdio_env_var_source_does_not_copy_local_env)$/) | test(/^unified_exec::mod_tests::(unified_exec_uses_remote_exec_server_when_configured|remote_exec_server_rejects_inherited_fd_launches)$/))'
+            )
+          fi
+
+          "${nextest_args[@]}"
         env:
           RUST_BACKTRACE: 1
           RUST_MIN_STACK: "8388608" # 8 MiB
