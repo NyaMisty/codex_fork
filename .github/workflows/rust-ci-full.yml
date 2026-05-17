@@ -453,6 +453,41 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --target ${{ matrix.target }} --tests --profile ${{ matrix.profile }} --timings -- -D warnings
 
+      - name: Build codex binary artifact
+        if: ${{ matrix.profile == 'release' }}
+        run: cargo build -p codex-cli --bin codex --target ${{ matrix.target }} --profile ${{ matrix.profile }} --locked
+
+      - name: Stage codex binary artifact
+        if: ${{ matrix.profile == 'release' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          suffix=""
+          if [[ "$target" == *windows* ]]; then
+            suffix=".exe"
+          fi
+
+          binary="target/${target}/release/codex${suffix}"
+          runner_temp="${RUNNER_TEMP//\\//}"
+          dest="${runner_temp}/codex-binary-${target}"
+          mkdir -p "$dest"
+          cp "$binary" "$dest/codex${suffix}"
+          chmod 0755 "$dest/codex${suffix}" || true
+          "$dest/codex${suffix}" --version
+          (
+            cd "$dest"
+            sha256sum "codex${suffix}" > SHA256SUMS
+          )
+
+      - name: Upload codex binary artifact
+        if: ${{ matrix.profile == 'release' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-binary-${{ matrix.target }}
+          path: ${{ runner.temp }}/codex-binary-${{ matrix.target }}
+          if-no-files-found: error
+
       - name: Upload Cargo timings (clippy)
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
