@@ -73,6 +73,16 @@ fn extract_conversation_id(path: &std::path::Path) -> String {
         .to_string()
 }
 
+fn touch_session_file_newer(path: &std::path::Path) -> anyhow::Result<()> {
+    let updated_at = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    let times = std::fs::FileTimes::new().set_modified(updated_at);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)?
+        .set_times(times)?;
+    Ok(())
+}
+
 fn last_user_image_count(path: &std::path::Path) -> usize {
     let content = std::fs::read_to_string(path).unwrap_or_default();
     let mut last_count = 0;
@@ -125,6 +135,12 @@ async fn mount_exec_responses(
     count: usize,
 ) -> core_test_support::responses::ResponseMock {
     responses::mount_sse_sequence(server, (0..count).map(exec_sse_response).collect()).await
+}
+
+async fn mount_resume_cwd_filter_responses(
+    server: &MockServer,
+) -> core_test_support::responses::ResponseMock {
+    mount_exec_responses(server, /*count*/ 4).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -239,7 +255,7 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
-    let _response_mock = mount_exec_responses(&server, /*count*/ 5).await;
+    let _response_mock = mount_resume_cwd_filter_responses(&server).await;
 
     let dir_a = TempDir::new()?;
     let dir_b = TempDir::new()?;
@@ -270,28 +286,7 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
     let path_b = find_session_file_containing_marker(&sessions_dir, &marker_b)
         .expect("no session file found for marker_b");
 
-    // `updated_at` is second-granularity, so ensure the touch lands in a later second
-    // than the initial session creation on fast CI (especially Windows).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-
-    // Make thread B deterministically newest according to rollout metadata.
-    let session_id_b = extract_conversation_id(&path_b);
-    let marker_b_touch = format!("resume-cwd-b-touch-{}", Uuid::new_v4());
-    let prompt_b_touch = format!("echo {marker_b_touch}");
-    test.cmd_with_server(&server)
-        .arg("--skip-git-repo-check")
-        .arg("-C")
-        .arg(dir_b.path())
-        .arg("resume")
-        .arg(&session_id_b)
-        .arg(&prompt_b_touch)
-        .assert()
-        .success();
-
-    // `resume --last` sorts by `updated_at`, which is second-granularity. Sleep so
-    // the upcoming `resume --last --all` write lands in a later second and becomes
-    // deterministically newest (instead of tying and falling back to UUID order).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    touch_session_file_newer(&path_b)?;
 
     let marker_b2 = format!("resume-cwd-b-2-{}", Uuid::new_v4());
     let prompt_b2 = format!("echo {marker_b2}");
@@ -312,6 +307,7 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
         resumed_path_all, path_b,
         "resume --last --all should pick newest session"
     );
+    touch_session_file_newer(&resumed_path_all)?;
 
     let marker_a2 = format!("resume-cwd-a-2-{}", Uuid::new_v4());
     let prompt_a2 = format!("echo {marker_a2}");

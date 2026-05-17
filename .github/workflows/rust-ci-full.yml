@@ -700,7 +700,14 @@ jobs:
 
       - name: tests
         id: test
-        run: cargo nextest run --no-fail-fast --target ${{ matrix.target }} --cargo-profile ci-test --timings
+        shell: bash
+        run: |
+          set -euo pipefail
+          nextest_filter='all()'
+          if [[ '${{ matrix.remote_env }}' == 'true' ]]; then
+            nextest_filter='package(codex-core) & (test(remote_env) | test(unified_exec) | test(view_image) | test(rmcp_client) | test(apply_patch_cli) | test(agents_md) | test(hierarchical_agents) | test(skills))'
+          fi
+          cargo nextest run --no-fail-fast --target ${{ matrix.target }} --cargo-profile ci-test --timings -E "${nextest_filter}"
         env:
           RUST_BACKTRACE: 1
           RUST_MIN_STACK: "8388608" # 8 MiB
