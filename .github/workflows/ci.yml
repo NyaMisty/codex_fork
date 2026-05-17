@@ -7,7 +7,7 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
     env:
       NODE_OPTIONS: --max-old-space-size=4096
     steps:
@@ -25,6 +25,37 @@ jobs:
 
       - name: Verify Bazel clippy flags match Cargo workspace lints
         run: python3 .github/scripts/verify_bazel_clippy_lints.py
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+
+      - name: Install Linux binary build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+
+      - name: Build full codex binary
+        working-directory: codex-rs
+        run: cargo build -p codex-cli --bin codex --locked
+
+      - name: Stage codex binary artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/codex-binary"
+          install -m 755 codex-rs/target/debug/codex "${RUNNER_TEMP}/codex-binary/codex"
+          "${RUNNER_TEMP}/codex-binary/codex" --version
+          (
+            cd "${RUNNER_TEMP}/codex-binary"
+            sha256sum codex > SHA256SUMS
+          )
+
+      - name: Upload codex binary artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-binary-linux-x64
+          path: ${{ runner.temp }}/codex-binary
+          if-no-files-found: error
 
       - name: Setup pnpm
         uses: pnpm/action-setup@a8198c4bff370c8506180b035930dea56dbd5288 # v5

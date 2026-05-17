@@ -337,8 +337,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpServerRefreshConfig;
-use codex_protocol::protocol::ModelRerouteEvent;
-use codex_protocol::protocol::ModelRerouteReason;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::ModelVerificationEvent;
 use codex_protocol::protocol::NetworkApprovalContext;
@@ -421,9 +419,6 @@ pub(crate) struct CodexSpawnArgs {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
-const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
-const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
-
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
     pub(crate) async fn spawn(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
@@ -2515,45 +2510,6 @@ impl Session {
     ) {
         let mut state = self.state.lock().await;
         state.record_items(items.iter(), turn_context.truncation_policy);
-    }
-
-    async fn maybe_warn_on_server_model_mismatch(
-        self: &Arc<Self>,
-        turn_context: &Arc<TurnContext>,
-        server_model: String,
-    ) -> bool {
-        let requested_model = turn_context.model_info.slug.clone();
-        let server_model_normalized = server_model.to_ascii_lowercase();
-        let requested_model_normalized = requested_model.to_ascii_lowercase();
-        if server_model_normalized == requested_model_normalized {
-            info!("server reported model {server_model} (matches requested model)");
-            return false;
-        }
-
-        warn!("server reported model {server_model} while requested model was {requested_model}");
-
-        let warning_message = format!(
-            "Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: {CYBER_VERIFY_URL} or learn more: {CYBER_SAFETY_URL}"
-        );
-
-        self.send_event(
-            turn_context,
-            EventMsg::ModelReroute(ModelRerouteEvent {
-                from_model: requested_model.clone(),
-                to_model: server_model.clone(),
-                reason: ModelRerouteReason::HighRiskCyberActivity,
-            }),
-        )
-        .await;
-
-        self.send_event(
-            turn_context,
-            EventMsg::Warning(WarningEvent {
-                message: warning_message.clone(),
-            }),
-        )
-        .await;
-        true
     }
 
     pub(crate) async fn emit_model_verification(

@@ -7,9 +7,7 @@ on:
 
 jobs:
   python-sdk:
-    runs-on:
-      group: codex-runners
-      labels: codex-linux-x64
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -42,10 +40,8 @@ jobs:
             '
 
   sdks:
-    runs-on:
-      group: codex-runners
-      labels: codex-linux-x64
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -53,7 +49,22 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - name: Check whether TypeScript SDK tests should run
+        id: sdk_gate
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Skipping TypeScript SDK tests without BuildBuddy credentials; fork PRs use python-sdk plus the cargo-native binary build artifact."
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
       - name: Install Linux bwrap build dependencies
+        if: ${{ steps.sdk_gate.outputs.run == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -61,23 +72,27 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
 
       - name: Setup pnpm
+        if: ${{ steps.sdk_gate.outputs.run == 'true' }}
         uses: pnpm/action-setup@a8198c4bff370c8506180b035930dea56dbd5288 # v5
         with:
           run_install: false
 
       - name: Setup Node.js
+        if: ${{ steps.sdk_gate.outputs.run == 'true' }}
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: 22
           cache: pnpm
 
       - name: Set up Bazel CI
+        if: ${{ steps.sdk_gate.outputs.run == 'true' }}
         id: setup_bazel
         uses: ./.github/actions/setup-bazel-ci
         with:
           target: x86_64-unknown-linux-gnu
 
       - name: Build codex with Bazel
+        if: ${{ steps.sdk_gate.outputs.run == 'true' }}
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
@@ -133,25 +148,30 @@ jobs:
           echo "CODEX_EXEC_PATH=${install_dir}/codex" >> "$GITHUB_ENV"
 
       - name: Warm up Bazel-built codex
+        if: ${{ steps.sdk_gate.outputs.run == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           "${CODEX_EXEC_PATH}" --version
 
       - name: Install dependencies
+        if: ${{ steps.sdk_gate.outputs.run == 'true' }}
         run: pnpm install --frozen-lockfile
 
       - name: Build SDK packages
+        if: ${{ steps.sdk_gate.outputs.run == 'true' }}
         run: pnpm -r --filter ./sdk/typescript run build
 
       - name: Lint SDK packages
+        if: ${{ steps.sdk_gate.outputs.run == 'true' }}
         run: pnpm -r --filter ./sdk/typescript run lint
 
       - name: Test SDK packages
+        if: ${{ steps.sdk_gate.outputs.run == 'true' }}
         run: pnpm -r --filter ./sdk/typescript run test
 
       - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.setup_bazel.outputs.cache-hit != 'true'
+        if: ${{ always() && !cancelled() && steps.sdk_gate.outputs.run == 'true' && steps.setup_bazel.outputs.cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:

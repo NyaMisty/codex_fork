@@ -120,6 +120,9 @@ use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
 
+const CYBER_POLICY_FALLBACK_MODEL: &str = "gpt-5.2";
+const MAX_CYBER_SAFETY_RETRIES_PER_TURN: usize = 1;
+
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -343,16 +346,6 @@ pub(crate) async fn run_turn(
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
         .await;
     record_additional_contexts(&sess, &turn_context, additional_contexts).await;
-    if !input.is_empty() {
-        // Track the previous-turn baseline from the regular user-turn path only so
-        // standalone tasks (compact/shell/review) cannot suppress future
-        // model/realtime injections.
-        sess.set_previous_turn_settings(Some(PreviousTurnSettings {
-            model: turn_context.model_info.slug.clone(),
-            realtime_active: Some(turn_context.realtime_active),
-        }))
-        .await;
-    }
     if !skill_items.is_empty() {
         sess.record_conversation_items(&turn_context, &skill_items)
             .await;
@@ -363,7 +356,6 @@ pub(crate) async fn run_turn(
     }
 
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
-
     let skills_outcome = Some(turn_context.turn_skills.outcome.as_ref());
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
@@ -383,9 +375,13 @@ pub(crate) async fn run_turn(
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
     let mut can_drain_pending_input = input.is_empty();
+    let mut sampling_turn_context = Arc::clone(&turn_context);
+    let mut cyber_safety_retry_count = 0usize;
+    let mut previous_turn_settings_model = turn_context.model_info.slug.clone();
+    let mut previous_turn_settings_realtime_active = turn_context.realtime_active;
 
-    loop {
-        if run_pending_session_start_hooks(&sess, &turn_context).await {
+    'turn_loop: loop {
+        if run_pending_session_start_hooks(&sess, &sampling_turn_context).await {
             break;
         }
 
@@ -405,7 +401,8 @@ pub(crate) async fn run_turn(
         if !pending_input.is_empty() {
             let mut pending_input_iter = pending_input.into_iter();
             while let Some(pending_input_item) = pending_input_iter.next() {
-                match inspect_pending_input(&sess, &turn_context, pending_input_item).await {
+                match inspect_pending_input(&sess, &sampling_turn_context, pending_input_item).await
+                {
                     PendingInputHookDisposition::Accepted(pending_input) => {
                         accepted_pending_input.push(*pending_input);
                     }
@@ -427,9 +424,14 @@ pub(crate) async fn run_turn(
 
         let has_accepted_pending_input = !accepted_pending_input.is_empty();
         for pending_input in accepted_pending_input {
-            record_pending_input(&sess, &turn_context, pending_input).await;
+            record_pending_input(&sess, &sampling_turn_context, pending_input).await;
         }
-        record_additional_contexts(&sess, &turn_context, blocked_pending_input_contexts).await;
+        record_additional_contexts(
+            &sess,
+            &sampling_turn_context,
+            blocked_pending_input_contexts,
+        )
+        .await;
 
         if blocked_pending_input && !has_accepted_pending_input {
             if requeued_pending_input {
@@ -438,236 +440,288 @@ pub(crate) async fn run_turn(
             break;
         }
 
-        // Construct the input that we will send to the model.
-        let sampling_request_input: Vec<ResponseItem> = {
-            sess.clone_history()
-                .await
-                .for_prompt(&turn_context.model_info.input_modalities)
-        };
-
-        let sampling_request_input_messages = sampling_request_input
-            .iter()
-            .filter_map(|item| match parse_turn_item(item) {
-                Some(TurnItem::UserMessage(user_message)) => Some(user_message),
-                _ => None,
-            })
-            .map(|user_message| user_message.message())
-            .collect::<Vec<String>>();
-        let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
-        match run_sampling_request(
-            Arc::clone(&sess),
-            Arc::clone(&turn_context),
-            Arc::clone(&turn_extension_data),
-            Arc::clone(&turn_diff_tracker),
-            &mut client_session,
-            turn_metadata_header.as_deref(),
-            sampling_request_input,
-            &explicitly_enabled_connectors,
-            skills_outcome,
-            cancellation_token.child_token(),
-        )
-        .await
-        {
-            Ok(sampling_request_output) => {
-                let SamplingRequestResult {
-                    needs_follow_up: model_needs_follow_up,
-                    last_agent_message: sampling_request_last_agent_message,
-                } = sampling_request_output;
-                can_drain_pending_input = true;
-                let has_pending_input = sess.has_pending_input().await;
-                let needs_follow_up = model_needs_follow_up || has_pending_input;
-                let total_usage_tokens = sess.get_total_token_usage().await;
-                let token_limit_reached = total_usage_tokens >= auto_compact_limit;
-
-                let estimated_token_count =
-                    sess.get_estimated_token_count(turn_context.as_ref()).await;
-
-                trace!(
-                    turn_id = %turn_context.sub_id,
-                    total_usage_tokens,
-                    estimated_token_count = ?estimated_token_count,
-                    auto_compact_limit,
-                    token_limit_reached,
-                    model_needs_follow_up,
-                    has_pending_input,
-                    needs_follow_up,
-                    "post sampling token usage"
-                );
-
-                // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
-                if token_limit_reached && needs_follow_up {
-                    let reset_client_session = match run_auto_compact(
-                        &sess,
-                        &turn_context,
-                        &mut client_session,
-                        InitialContextInjection::BeforeLastUserMessage,
-                        CompactionReason::ContextLimit,
-                        CompactionPhase::MidTurn,
-                    )
-                    .await
-                    {
-                        Ok(reset_client_session) => reset_client_session,
-                        Err(_) => return None,
-                    };
-                    if reset_client_session {
+        let (sampling_request_output, sampling_request_input_messages) = loop {
+            let history_before_sampling = sess.clone_history().await;
+            let sampling_request_input: Vec<ResponseItem> = {
+                history_before_sampling
+                    .clone()
+                    .for_prompt(&sampling_turn_context.model_info.input_modalities)
+            };
+            let sampling_request_input_messages = sampling_request_input
+                .iter()
+                .filter_map(|item| match parse_turn_item(item) {
+                    Some(TurnItem::UserMessage(user_message)) => Some(user_message),
+                    _ => None,
+                })
+                .map(|user_message| user_message.message())
+                .collect::<Vec<String>>();
+            let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
+            match run_sampling_request(
+                Arc::clone(&sess),
+                Arc::clone(&sampling_turn_context),
+                Arc::clone(&turn_extension_data),
+                Arc::clone(&turn_diff_tracker),
+                &mut client_session,
+                turn_metadata_header.as_deref(),
+                sampling_request_input,
+                &explicitly_enabled_connectors,
+                skills_outcome,
+                cancellation_token.child_token(),
+            )
+            .await
+            {
+                Ok(SamplingRequestStatus::Complete(sampling_request_output)) => {
+                    break (sampling_request_output, sampling_request_input_messages);
+                }
+                Ok(SamplingRequestStatus::RetryCyberSafety(retry)) => {
+                    if cyber_safety_retry_count < MAX_CYBER_SAFETY_RETRIES_PER_TURN {
+                        sess.replace_history(
+                            history_before_sampling.raw_items().to_vec(),
+                            history_before_sampling.reference_context_item(),
+                        )
+                        .await;
+                        cyber_safety_retry_count += 1;
+                        sampling_turn_context = Arc::new(
+                            sampling_turn_context
+                                .with_model(
+                                    retry.fallback_model.clone(),
+                                    &sess.services.models_manager,
+                                )
+                                .await,
+                        );
                         client_session.reset_websocket_session();
-                    }
-                    can_drain_pending_input = !model_needs_follow_up;
-                    continue;
-                }
-
-                if !needs_follow_up {
-                    last_agent_message = sampling_request_last_agent_message;
-                    let stop_hook_permission_mode = match turn_context.approval_policy.value() {
-                        AskForApproval::Never => "bypassPermissions",
-                        AskForApproval::UnlessTrusted
-                        | AskForApproval::OnFailure
-                        | AskForApproval::OnRequest
-                        | AskForApproval::Granular(_) => "default",
-                    }
-                    .to_string();
-                    let stop_request = codex_hooks::StopRequest {
-                        session_id: sess.session_id().into(),
-                        turn_id: turn_context.sub_id.clone(),
-                        #[allow(deprecated)]
-                        cwd: turn_context.cwd.clone(),
-                        transcript_path: sess.hook_transcript_path().await,
-                        model: turn_context.model_info.slug.clone(),
-                        permission_mode: stop_hook_permission_mode,
-                        stop_hook_active,
-                        last_assistant_message: last_agent_message.clone(),
-                    };
-                    let hooks = sess.hooks();
-                    for run in hooks.preview_stop(&stop_request) {
-                        sess.send_event(
-                            &turn_context,
-                            EventMsg::HookStarted(codex_protocol::protocol::HookStartedEvent {
-                                turn_id: Some(turn_context.sub_id.clone()),
-                                run,
-                            }),
-                        )
-                        .await;
-                    }
-                    let stop_outcome = hooks.run_stop(stop_request).await;
-                    emit_hook_completed_events(&sess, &turn_context, stop_outcome.hook_events)
-                        .await;
-                    if stop_outcome.should_block {
-                        if let Some(hook_prompt_message) =
-                            build_hook_prompt_message(&stop_outcome.continuation_fragments)
-                        {
-                            sess.record_conversation_items(
-                                &turn_context,
-                                std::slice::from_ref(&hook_prompt_message),
-                            )
-                            .await;
-                            stop_hook_active = true;
-                            continue;
-                        } else {
-                            sess.send_event(
-                                &turn_context,
-                                EventMsg::Warning(WarningEvent {
-                                    message: "Stop hook requested continuation without a prompt; ignoring the block.".to_string(),
-                                }),
-                            )
-                            .await;
-                        }
-                    }
-                    if stop_outcome.should_stop {
-                        break;
-                    }
-                    let hook_outcomes = sess
-                        .hooks()
-                        .dispatch(HookPayload {
-                            session_id: sess.session_id().into(),
-                            #[allow(deprecated)]
-                            cwd: turn_context.cwd.clone(),
-                            client: turn_context.app_server_client_name.clone(),
-                            triggered_at: chrono::Utc::now(),
-                            hook_event: HookEvent::AfterAgent {
-                                event: HookEventAfterAgent {
-                                    thread_id: sess.conversation_id,
-                                    turn_id: turn_context.sub_id.clone(),
-                                    input_messages: sampling_request_input_messages,
-                                    last_assistant_message: last_agent_message.clone(),
-                                },
-                            },
-                        })
-                        .await;
-
-                    let mut abort_message = None;
-                    for hook_outcome in hook_outcomes {
-                        let hook_name = hook_outcome.hook_name;
-                        match hook_outcome.result {
-                            HookResult::Success => {}
-                            HookResult::FailedContinue(error) => {
-                                warn!(
-                                    turn_id = %turn_context.sub_id,
-                                    hook_name = %hook_name,
-                                    error = %error,
-                                    "after_agent hook failed; continuing"
-                                );
-                            }
-                            HookResult::FailedAbort(error) => {
-                                let message = format!(
-                                    "after_agent hook '{hook_name}' failed and aborted turn completion: {error}"
-                                );
-                                warn!(
-                                    turn_id = %turn_context.sub_id,
-                                    hook_name = %hook_name,
-                                    error = %error,
-                                    "after_agent hook failed; aborting operation"
-                                );
-                                if abort_message.is_none() {
-                                    abort_message = Some(message);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(message) = abort_message {
-                        sess.send_event(
-                            &turn_context,
-                            EventMsg::Error(ErrorEvent {
-                                message,
-                                codex_error_info: None,
-                            }),
-                        )
-                        .await;
-                        return None;
-                    }
-                    break;
-                }
-                continue;
-            }
-            Err(CodexErr::TurnAborted) => {
-                // Aborted turn is reported via a different event.
-                break;
-            }
-            Err(CodexErr::InvalidImageRequest()) => {
-                {
-                    let mut state = sess.state.lock().await;
-                    error_or_panic(
-                        "Invalid image detected; sanitizing tool output to prevent poisoning",
-                    );
-                    if state.history.replace_last_turn_images("Invalid image") {
+                        info!(
+                            "retrying turn after cyber safety reroute with model {}",
+                            sampling_turn_context.model_info.slug
+                        );
+                        previous_turn_settings_model =
+                            sampling_turn_context.model_info.slug.clone();
+                        previous_turn_settings_realtime_active =
+                            sampling_turn_context.realtime_active;
                         continue;
                     }
+                    let event = if let Some(err) = retry.error {
+                        info!("Turn error after cyber safety retry budget was exhausted: {err:#}");
+                        EventMsg::Error(err.to_error_event(/*message_prefix*/ None))
+                    } else {
+                        EventMsg::Error(ErrorEvent {
+                            message:
+                                "This request has been flagged for potentially high-risk cyber activity."
+                                    .to_string(),
+                            codex_error_info: Some(CodexErrorInfo::CyberPolicy),
+                        })
+                    };
+                    sess.send_event(&sampling_turn_context, event).await;
+                    break 'turn_loop;
                 }
+                Err(CodexErr::TurnAborted) => {
+                    // Aborted turn is reported via a different event.
+                    break 'turn_loop;
+                }
+                Err(CodexErr::InvalidImageRequest()) => {
+                    {
+                        let mut state = sess.state.lock().await;
+                        error_or_panic(
+                            "Invalid image detected; sanitizing tool output to prevent poisoning",
+                        );
+                        if state.history.replace_last_turn_images("Invalid image") {
+                            continue;
+                        }
+                    }
 
-                let event = EventMsg::Error(ErrorEvent {
-                    message: "Invalid image in your last message. Please remove it and try again."
-                        .to_string(),
-                    codex_error_info: Some(CodexErrorInfo::BadRequest),
-                });
-                sess.send_event(&turn_context, event).await;
+                    let event = EventMsg::Error(ErrorEvent {
+                        message:
+                            "Invalid image in your last message. Please remove it and try again."
+                                .to_string(),
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    });
+                    sess.send_event(&sampling_turn_context, event).await;
+                    break 'turn_loop;
+                }
+                Err(e) => {
+                    info!("Turn error: {e:#}");
+                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                    sess.send_event(&sampling_turn_context, event).await;
+                    // let the user continue the conversation
+                    break 'turn_loop;
+                }
+            }
+        };
+
+        let SamplingRequestResult {
+            needs_follow_up: model_needs_follow_up,
+            last_agent_message: sampling_request_last_agent_message,
+        } = sampling_request_output;
+        can_drain_pending_input = true;
+        let has_pending_input = sess.has_pending_input().await;
+        let needs_follow_up = model_needs_follow_up || has_pending_input;
+        let total_usage_tokens = sess.get_total_token_usage().await;
+        let token_limit_reached = total_usage_tokens >= auto_compact_limit;
+
+        let estimated_token_count = sess
+            .get_estimated_token_count(sampling_turn_context.as_ref())
+            .await;
+
+        trace!(
+            turn_id = %turn_context.sub_id,
+            total_usage_tokens,
+            estimated_token_count = ?estimated_token_count,
+            auto_compact_limit,
+            token_limit_reached,
+            model_needs_follow_up,
+            has_pending_input,
+            needs_follow_up,
+            "post sampling token usage"
+        );
+
+        // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
+        if token_limit_reached && needs_follow_up {
+            let reset_client_session = match run_auto_compact(
+                &sess,
+                &sampling_turn_context,
+                &mut client_session,
+                InitialContextInjection::BeforeLastUserMessage,
+                CompactionReason::ContextLimit,
+                CompactionPhase::MidTurn,
+            )
+            .await
+            {
+                Ok(reset_client_session) => reset_client_session,
+                Err(_) => return None,
+            };
+            if reset_client_session {
+                client_session.reset_websocket_session();
+            }
+            can_drain_pending_input = !model_needs_follow_up;
+            continue;
+        }
+
+        if !needs_follow_up {
+            last_agent_message = sampling_request_last_agent_message;
+            let stop_hook_permission_mode = match turn_context.approval_policy.value() {
+                AskForApproval::Never => "bypassPermissions",
+                AskForApproval::UnlessTrusted
+                | AskForApproval::OnFailure
+                | AskForApproval::OnRequest
+                | AskForApproval::Granular(_) => "default",
+            }
+            .to_string();
+            let stop_request = codex_hooks::StopRequest {
+                session_id: sess.session_id().into(),
+                turn_id: sampling_turn_context.sub_id.clone(),
+                #[allow(deprecated)]
+                cwd: sampling_turn_context.cwd.clone(),
+                transcript_path: sess.hook_transcript_path().await,
+                model: sampling_turn_context.model_info.slug.clone(),
+                permission_mode: stop_hook_permission_mode,
+                stop_hook_active,
+                last_assistant_message: last_agent_message.clone(),
+            };
+            let hooks = sess.hooks();
+            for run in hooks.preview_stop(&stop_request) {
+                sess.send_event(
+                    &sampling_turn_context,
+                    EventMsg::HookStarted(codex_protocol::protocol::HookStartedEvent {
+                        turn_id: Some(sampling_turn_context.sub_id.clone()),
+                        run,
+                    }),
+                )
+                .await;
+            }
+            let stop_outcome = hooks.run_stop(stop_request).await;
+            emit_hook_completed_events(&sess, &sampling_turn_context, stop_outcome.hook_events)
+                .await;
+            if stop_outcome.should_block {
+                if let Some(hook_prompt_message) =
+                    build_hook_prompt_message(&stop_outcome.continuation_fragments)
+                {
+                    sess.record_conversation_items(
+                        &sampling_turn_context,
+                        std::slice::from_ref(&hook_prompt_message),
+                    )
+                    .await;
+                    stop_hook_active = true;
+                    continue;
+                } else {
+                    sess.send_event(
+                        &sampling_turn_context,
+                        EventMsg::Warning(WarningEvent {
+                            message: "Stop hook requested continuation without a prompt; ignoring the block.".to_string(),
+                        }),
+                    )
+                    .await;
+                }
+            }
+            if !input.is_empty() {
+                sess.set_previous_turn_settings(Some(PreviousTurnSettings {
+                    model: previous_turn_settings_model.clone(),
+                    realtime_active: Some(previous_turn_settings_realtime_active),
+                }))
+                .await;
+            }
+            if stop_outcome.should_stop {
                 break;
             }
-            Err(e) => {
-                info!("Turn error: {e:#}");
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
-                // let the user continue the conversation
-                break;
+            let hook_outcomes = sess
+                .hooks()
+                .dispatch(HookPayload {
+                    session_id: sess.session_id().into(),
+                    #[allow(deprecated)]
+                    cwd: sampling_turn_context.cwd.clone(),
+                    client: sampling_turn_context.app_server_client_name.clone(),
+                    triggered_at: chrono::Utc::now(),
+                    hook_event: HookEvent::AfterAgent {
+                        event: HookEventAfterAgent {
+                            thread_id: sess.conversation_id,
+                            turn_id: sampling_turn_context.sub_id.clone(),
+                            input_messages: sampling_request_input_messages,
+                            last_assistant_message: last_agent_message.clone(),
+                        },
+                    },
+                })
+                .await;
+
+            let mut abort_message = None;
+            for hook_outcome in hook_outcomes {
+                let hook_name = hook_outcome.hook_name;
+                match hook_outcome.result {
+                    HookResult::Success => {}
+                    HookResult::FailedContinue(error) => {
+                        warn!(
+                            turn_id = %turn_context.sub_id,
+                            hook_name = %hook_name,
+                            error = %error,
+                            "after_agent hook failed; continuing"
+                        );
+                    }
+                    HookResult::FailedAbort(error) => {
+                        let message = format!(
+                            "after_agent hook '{hook_name}' failed and aborted turn completion: {error}"
+                        );
+                        warn!(
+                            turn_id = %turn_context.sub_id,
+                            hook_name = %hook_name,
+                            error = %error,
+                            "after_agent hook failed; aborting operation"
+                        );
+                        if abort_message.is_none() {
+                            abort_message = Some(message);
+                        }
+                    }
+                }
             }
+            if let Some(message) = abort_message {
+                sess.send_event(
+                    &sampling_turn_context,
+                    EventMsg::Error(ErrorEvent {
+                        message,
+                        codex_error_info: None,
+                    }),
+                )
+                .await;
+                return None;
+            }
+            break;
         }
     }
 
@@ -724,6 +778,39 @@ async fn track_turn_resolved_config_analytics(
 
 struct PreSamplingCompactResult {
     reset_client_session: bool,
+}
+
+#[derive(Debug)]
+struct CyberSafetyRetry {
+    fallback_model: String,
+    error: Option<CodexErr>,
+}
+
+enum SamplingRequestStatus {
+    Complete(SamplingRequestResult),
+    RetryCyberSafety(CyberSafetyRetry),
+}
+
+impl From<SamplingRequestResult> for SamplingRequestStatus {
+    fn from(result: SamplingRequestResult) -> Self {
+        Self::Complete(result)
+    }
+}
+
+fn retry_for_server_model_mismatch(
+    turn_context: &TurnContext,
+    server_model: &str,
+) -> Option<CyberSafetyRetry> {
+    let requested_model = turn_context.model_info.slug.as_str();
+    if server_model.eq_ignore_ascii_case(requested_model) {
+        info!("server reported model {server_model} (matches requested model)");
+        return None;
+    }
+
+    Some(CyberSafetyRetry {
+        fallback_model: server_model.to_string(),
+        error: None,
+    })
 }
 
 async fn run_pre_sampling_compact(
@@ -1021,7 +1108,7 @@ async fn run_sampling_request(
     explicitly_enabled_connectors: &HashSet<String>,
     skills_outcome: Option<&SkillLoadOutcome>,
     cancellation_token: CancellationToken,
-) -> CodexResult<SamplingRequestResult> {
+) -> CodexResult<SamplingRequestStatus> {
     let router = built_tools(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -1079,8 +1166,8 @@ async fn run_sampling_request(
         )
         .await
         {
-            Ok(output) => {
-                return Ok(output);
+            Ok(status) => {
+                return Ok(status);
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
@@ -1092,6 +1179,12 @@ async fn run_sampling_request(
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
                 return Err(CodexErr::UsageLimitReached(e));
+            }
+            Err(err @ CodexErr::CyberPolicy { .. }) => {
+                return Ok(SamplingRequestStatus::RetryCyberSafety(CyberSafetyRetry {
+                    fallback_model: CYBER_POLICY_FALLBACK_MODEL.to_string(),
+                    error: Some(err),
+                }));
             }
             Err(err) => err,
         };
@@ -1847,7 +1940,7 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
-) -> CodexResult<SamplingRequestResult> {
+) -> CodexResult<SamplingRequestStatus> {
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
@@ -1895,7 +1988,7 @@ async fn try_run_sampling_request(
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
     let mut completed_response_id: Option<String> = None;
-    let outcome: CodexResult<SamplingRequestResult> = loop {
+    let outcome: CodexResult<SamplingRequestStatus> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
             "handle_responses",
@@ -2027,7 +2120,8 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
-                    });
+                    }
+                    .into());
                 }
             }
             ResponseEvent::OutputItemAdded(item) => {
@@ -2103,16 +2197,14 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ServerModel(server_model) => {
-                if !turn_context
-                    .server_model_warning_emitted
-                    .load(Ordering::Relaxed)
-                    && sess
-                        .maybe_warn_on_server_model_mismatch(&turn_context, server_model)
-                        .await
+                if let Some(retry) =
+                    retry_for_server_model_mismatch(&turn_context, server_model.as_str())
                 {
-                    turn_context
-                        .server_model_warning_emitted
-                        .store(true, Ordering::Relaxed);
+                    warn!(
+                        "server reported model {} while requested model was {}; retrying the turn on the server fallback model",
+                        retry.fallback_model, turn_context.model_info.slug
+                    );
+                    break Ok(SamplingRequestStatus::RetryCyberSafety(retry));
                 }
             }
             ResponseEvent::ModelVerifications(verifications) => {
@@ -2160,7 +2252,8 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
-                });
+                }
+                .into());
             }
             ResponseEvent::OutputTextDelta(delta) => {
                 // In review child threads, suppress assistant text deltas; the
