@@ -28,8 +28,10 @@ jobs:
         include:
           # macOS
           - os: macos-15-xlarge
+            runs_on: macos-15
             target: aarch64-apple-darwin
           - os: macos-15-xlarge
+            runs_on: macos-15
             target: x86_64-apple-darwin
 
           # Linux
@@ -44,7 +46,7 @@ jobs:
           # - os: ubuntu-24.04-arm
           #   target: aarch64-unknown-linux-gnu
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runs_on || matrix.os }}
 
     # Configure a human readable name for each job
     name: Bazel test on ${{ matrix.os }} for ${{ matrix.target }}
@@ -55,14 +57,29 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - name: Check whether Bazel test should run
+        id: bazel_test_gate
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Skipping Bazel test without BuildBuddy credentials; fork PRs use cargo-native CI plus the binary build artifact."
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
       - name: Check rusty_v8 MODULE.bazel checksums
-        if: matrix.os == 'ubuntu-24.04' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: ${{ steps.bazel_test_gate.outputs.run == 'true' && matrix.os == 'ubuntu-24.04' && matrix.target == 'x86_64-unknown-linux-gnu' }}
         shell: bash
         run: |
           python3 .github/scripts/rusty_v8_bazel.py check-module-bazel
           python3 -m unittest discover -s .github/scripts -p test_rusty_v8_bazel.py
 
       - name: Prepare Bazel CI
+        if: ${{ steps.bazel_test_gate.outputs.run == 'true' }}
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
@@ -70,11 +87,12 @@ jobs:
           cache-scope: bazel-${{ github.job }}
           install-test-prereqs: "true"
       - name: Check MODULE.bazel.lock is up to date
-        if: matrix.os == 'ubuntu-24.04' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: ${{ steps.bazel_test_gate.outputs.run == 'true' && matrix.os == 'ubuntu-24.04' && matrix.target == 'x86_64-unknown-linux-gnu' }}
         shell: bash
         run: ./scripts/check-module-bazel-lock.sh
 
       - name: bazel test //...
+        if: ${{ steps.bazel_test_gate.outputs.run == 'true' }}
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
@@ -110,7 +128,7 @@ jobs:
             "${bazel_targets[@]}"
 
       - name: Upload Bazel execution logs
-        if: always() && !cancelled()
+        if: ${{ always() && !cancelled() && steps.bazel_test_gate.outputs.run == 'true' }}
         continue-on-error: true
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -121,7 +139,7 @@ jobs:
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
       - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        if: ${{ always() && !cancelled() && steps.bazel_test_gate.outputs.run == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
@@ -150,7 +168,22 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - name: Check whether Windows Bazel shard should run
+        id: bazel_test_gate
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Skipping Windows Bazel shard without BuildBuddy credentials; fork PRs use cargo-native CI plus the binary build artifact."
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
       - name: Prepare Bazel CI
+        if: ${{ steps.bazel_test_gate.outputs.run == 'true' }}
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
@@ -162,6 +195,7 @@ jobs:
           install-test-prereqs: "true"
 
       - name: bazel test shard
+        if: ${{ steps.bazel_test_gate.outputs.run == 'true' }}
         env:
           BAZEL_TEST_SHARD: ${{ matrix.shard }}
           BAZEL_TEST_SHARD_COUNT: 4
@@ -172,7 +206,10 @@ jobs:
 
           bazel_test_query='tests(//...) except tests(//third_party/v8:all) except //codex-rs/code-mode:code-mode-unit-tests except //codex-rs/v8-poc:v8-poc-unit-tests except attr(tags, "manual", tests(//...))'
           mapfile -t bazel_targets < <(
-            MSYS2_ARG_CONV_EXCL='*' bazel query --output=label "${bazel_test_query}" \
+            ./.github/scripts/run-bazel-query-ci.sh \
+              --windows-cross-compile \
+              --output=label \
+              -- "${bazel_test_query}" \
               | LC_ALL=C sort
           )
 
@@ -215,7 +252,7 @@ jobs:
             "${selected_targets[@]}"
 
       - name: Upload Bazel execution logs
-        if: always() && !cancelled()
+        if: ${{ always() && !cancelled() && steps.bazel_test_gate.outputs.run == 'true' }}
         continue-on-error: true
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -255,7 +292,22 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - name: Check whether native Windows Bazel test should run
+        id: bazel_test_gate
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Skipping native Windows Bazel test without BuildBuddy credentials; fork PRs use cargo-native CI plus the binary build artifact."
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
       - name: Prepare Bazel CI
+        if: ${{ steps.bazel_test_gate.outputs.run == 'true' }}
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
@@ -264,6 +316,7 @@ jobs:
           install-test-prereqs: "true"
 
       - name: bazel test //...
+        if: ${{ steps.bazel_test_gate.outputs.run == 'true' }}
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
@@ -298,7 +351,7 @@ jobs:
             "${bazel_targets[@]}"
 
       - name: Upload Bazel execution logs
-        if: always() && !cancelled()
+        if: ${{ always() && !cancelled() && steps.bazel_test_gate.outputs.run == 'true' }}
         continue-on-error: true
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -309,7 +362,7 @@ jobs:
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
       - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        if: ${{ always() && !cancelled() && steps.bazel_test_gate.outputs.run == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
@@ -329,10 +382,11 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - os: macos-15-xlarge
+            runs_on: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-gnullvm
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Bazel clippy on ${{ matrix.os }} for ${{ matrix.target }}
 
     steps:
@@ -341,7 +395,22 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - name: Check whether Bazel clippy should run
+        id: bazel_clippy_gate
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Skipping Bazel clippy without BuildBuddy credentials; fork PRs use cargo-native CI plus the binary build artifact."
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
       - name: Prepare Bazel CI
+        if: ${{ steps.bazel_clippy_gate.outputs.run == 'true' }}
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
@@ -349,6 +418,7 @@ jobs:
           cache-scope: bazel-${{ github.job }}
 
       - name: bazel build --config=clippy lint targets
+        if: ${{ steps.bazel_clippy_gate.outputs.run == 'true' }}
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
@@ -392,7 +462,7 @@ jobs:
             "${bazel_targets[@]}"
 
       - name: Upload Bazel execution logs
-        if: always() && !cancelled()
+        if: ${{ always() && !cancelled() && steps.bazel_clippy_gate.outputs.run == 'true' }}
         continue-on-error: true
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -403,7 +473,7 @@ jobs:
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
       - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        if: ${{ always() && !cancelled() && steps.bazel_clippy_gate.outputs.run == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
@@ -419,10 +489,11 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - os: macos-15-xlarge
+            runs_on: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-gnullvm
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Verify release build on ${{ matrix.os }} for ${{ matrix.target }}
 
     steps:
@@ -431,7 +502,22 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - name: Check whether Bazel release verification should run
+        id: bazel_release_gate
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Skipping Bazel release verification without BuildBuddy credentials; fork PRs use cargo-native CI plus the binary build artifact."
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
       - name: Prepare Bazel CI
+        if: ${{ steps.bazel_release_gate.outputs.run == 'true' }}
         id: prepare_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
@@ -439,6 +525,7 @@ jobs:
           cache-scope: bazel-${{ github.job }}
 
       - name: bazel build verify-release-build targets
+        if: ${{ steps.bazel_release_gate.outputs.run == 'true' }}
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
@@ -483,7 +570,7 @@ jobs:
             "${bazel_targets[@]}"
 
       - name: Verify Bazel builds bwrap
-        if: runner.os == 'Linux'
+        if: ${{ steps.bazel_release_gate.outputs.run == 'true' && runner.os == 'Linux' }}
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
@@ -499,7 +586,7 @@ jobs:
             //codex-rs/bwrap:bwrap
 
       - name: Upload Bazel execution logs
-        if: always() && !cancelled()
+        if: ${{ always() && !cancelled() && steps.bazel_release_gate.outputs.run == 'true' }}
         continue-on-error: true
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -510,7 +597,7 @@ jobs:
       # Save the job-scoped Bazel repository cache after cache misses. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
       - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        if: ${{ always() && !cancelled() && steps.bazel_release_gate.outputs.run == 'true' && steps.prepare_bazel.outputs.repository-cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
