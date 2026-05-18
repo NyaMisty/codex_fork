@@ -170,12 +170,16 @@ jobs:
       run:
         working-directory: codex-rs
     env:
-      # Speed up repeated builds across CI runs by caching compiled objects, except on
-      # arm64 macOS runners cross-targeting x86_64 where ring/cc-rs can produce
-      # mixed-architecture archives under sccache.
-      USE_SCCACHE: ${{ (startsWith(matrix.runner, 'windows') || (matrix.runner == 'macos-15-xlarge' && matrix.target == 'x86_64-apple-darwin')) && 'false' || 'true' }}
+      USE_SCCACHE: "true"
       CARGO_INCREMENTAL: "0"
       SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_GHA_ENABLED: "on"
+      CARGO_PROFILE_DEV_DEBUG: "full"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_DEV_STRIP: "none"
+      CARGO_PROFILE_RELEASE_DEBUG: "full"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_RELEASE_STRIP: "none"
       # In rust-ci, representative release-profile checks use thin LTO for faster feedback.
       CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && 'thin' || 'fat' }}
 
@@ -318,26 +322,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "${ACTIONS_CACHE_URL:-}" && -n "${ACTIONS_RESULTS_URL:-}" && -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
-            echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
-            echo "Using sccache GitHub backend"
-          else
-            echo "SCCACHE_GHA_ENABLED=off" >> "$GITHUB_ENV"
-            echo "Using sccache local disk cache"
+          if [[ -z "${ACTIONS_CACHE_URL:-}" || -z "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
+            echo "GitHub Actions cache variables are required for sccache GHA backend."
+            echo "ACTIONS_CACHE_URL=${ACTIONS_CACHE_URL:+set}"
+            echo "ACTIONS_RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN:+set}"
+            exit 1
           fi
+          echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          echo "Using sccache GitHub Actions backend"
 
       - name: Enable sccache wrapper
         if: ${{ env.USE_SCCACHE == 'true' }}
         shell: bash
         run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-
-      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
-        name: Disable sccache wrapper (musl)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          echo "RUSTC_WORKSPACE_WRAPPER=" >> "$GITHUB_ENV"
 
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Prepare APT cache directories (musl)
@@ -389,7 +386,7 @@ jobs:
           if [[ -n "${ubsan}" ]]; then
             export LD_PRELOAD="${ubsan}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
           fi
-          exec "\$1" "\${@:2}"
+          exec sccache "\$@"
           EOF
           chmod +x "${wrapper}"
           echo "RUSTC_WRAPPER=${wrapper}" >> "$GITHUB_ENV"
@@ -466,15 +463,32 @@ jobs:
           path: codex-rs/target/**/cargo-timings/cargo-timing.html
           if-no-files-found: warn
 
-      - name: Build codex release artifacts
-        id: build_codex_release_artifacts
-        if: ${{ matrix.profile == 'release' && matrix.artifact == true }}
+      - name: Build codex artifacts
+        id: build_codex_artifacts
+        if: ${{ matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true) }}
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
+          profile="${{ matrix.profile }}"
           release_target_dir="${PWD}/target"
+          profile_args=()
+          profile_dir="debug"
+          case "$profile" in
+            dev)
+              profile_args=(--profile dev)
+              profile_dir="debug"
+              ;;
+            release)
+              profile_args=(--release)
+              profile_dir="release"
+              ;;
+            *)
+              echo "unsupported profile: $profile"
+              exit 1
+              ;;
+          esac
 
           cargo_with_timeout() {
             # Keep a GitHub-hosted runner from being externally killed mid-build
@@ -486,55 +500,72 @@ jobs:
             fi
           }
 
-          build_args="--bin codex"
-          built_bins="codex"
+          build_args=(--bin codex)
+          built_bins=(codex)
           suffix=""
           if [[ "$target" == *windows* ]]; then
             suffix=".exe"
           fi
 
           if [[ "$target" == *linux* ]]; then
-            cargo_with_timeout build --target "$target" --release --locked --timings --bin bwrap
-            bwrap_path="${release_target_dir}/${target}/release/bwrap"
+            cargo_with_timeout build --target "$target" "${profile_args[@]}" --locked --timings --bin bwrap
+            bwrap_path="${release_target_dir}/${target}/${profile_dir}/bwrap"
             if [[ ! -f "$bwrap_path" ]]; then
               echo "bwrap binary ${bwrap_path} not found"
               exit 1
             fi
             export CODEX_BWRAP_SHA256="$(sha256sum "$bwrap_path" | awk '{print $1}')"
-            built_bins="${built_bins} bwrap"
+            built_bins+=(bwrap)
           fi
 
           if [[ "$target" == *windows* ]]; then
-            build_args="${build_args} --bin codex-command-runner --bin codex-windows-sandbox-setup"
-            built_bins="${built_bins} codex-command-runner codex-windows-sandbox-setup"
+            build_args+=(--bin codex-command-runner --bin codex-windows-sandbox-setup)
+            built_bins+=(codex-command-runner codex-windows-sandbox-setup)
           fi
 
-          cargo_with_timeout build --target "$target" --release --locked --timings ${build_args}
+          cargo_with_timeout build --target "$target" "${profile_args[@]}" --locked --timings "${build_args[@]}"
 
-          echo "Built release binary sizes:"
-          for binary in ${built_bins}; do
-            path="${release_target_dir}/${target}/release/${binary}${suffix}"
+          echo "Built ${profile} binary sizes:"
+          for binary in "${built_bins[@]}"; do
+            path="${release_target_dir}/${target}/${profile_dir}/${binary}${suffix}"
             if [[ -f "$path" ]]; then
               printf '%12s  %s\n' "$(wc -c < "$path" | tr -d '[:space:]')" "$path"
             else
               echo "missing: $path"
             fi
+            if [[ "$target" == *windows* && -f "${release_target_dir}/${target}/${profile_dir}/${binary}.pdb" ]]; then
+              printf '%12s  %s\n' "$(wc -c < "${release_target_dir}/${target}/${profile_dir}/${binary}.pdb" | tr -d '[:space:]')" "${release_target_dir}/${target}/${profile_dir}/${binary}.pdb"
+            fi
           done
 
       - name: Stage codex binary artifact
         id: stage_codex_binary_artifact
-        if: ${{ always() && matrix.profile == 'release' && matrix.artifact == true }}
+        if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) }}
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
+          profile="${{ matrix.profile }}"
           suffix=""
           if [[ "$target" == *windows* ]]; then
             suffix=".exe"
           fi
-          artifact_dir="dist/${target}"
-          release_dir="target/${target}/release"
+          profile_dir="debug"
+          case "$profile" in
+            dev)
+              profile_dir="debug"
+              ;;
+            release)
+              profile_dir="release"
+              ;;
+            *)
+              echo "unsupported profile: $profile"
+              exit 1
+              ;;
+          esac
+          artifact_dir="dist/${target}-${profile}"
+          release_dir="target/${target}/${profile_dir}"
           repo_root="$PWD"
           rm -rf "$artifact_dir"
           mkdir -p "$artifact_dir"
@@ -609,9 +640,55 @@ jobs:
             fi
           }
 
+          require_symbols() {
+            local file="$1"
+            if [[ "$target" == *windows* ]]; then
+              return 0
+            fi
+
+            if command -v file >/dev/null 2>&1; then
+              file "$file"
+              if file "$file" | grep -qi 'stripped'; then
+                echo "artifact binary is stripped but symbols are required: $file"
+                exit 1
+              fi
+            fi
+
+            if [[ "$target" == *apple-darwin* ]]; then
+              if command -v dwarfdump >/dev/null 2>&1; then
+                if ! dwarfdump --debug-info "$file" 2>/dev/null | grep -q 'DW_TAG_compile_unit'; then
+                  echo "artifact binary is missing DWARF debug info: $file"
+                  exit 1
+                fi
+              elif command -v dsymutil >/dev/null 2>&1; then
+                if ! dsymutil --statistics "$file" 2>/dev/null | grep -Eq 'object files|debug map'; then
+                  echo "artifact binary is missing usable debug info: $file"
+                  exit 1
+                fi
+              else
+                echo "No tool available to verify macOS debug symbols for $file"
+                exit 1
+              fi
+            elif command -v readelf >/dev/null 2>&1; then
+              if ! readelf -S "$file" 2>/dev/null | grep -q '\.debug_info'; then
+                echo "artifact binary is missing .debug_info: $file"
+                exit 1
+              fi
+            elif command -v objdump >/dev/null 2>&1; then
+              if ! objdump -h "$file" 2>/dev/null | grep -q '\.debug_info'; then
+                echo "artifact binary is missing .debug_info: $file"
+                exit 1
+              fi
+            else
+              echo "No tool available to verify debug symbols for $file"
+              exit 1
+            fi
+          }
+
           write_manifest() {
             {
               echo "target: ${target}"
+              echo "profile: ${profile}"
               echo "release_dir: ${release_dir}"
               echo "artifact_dir: ${artifact_dir}"
               echo
@@ -641,6 +718,17 @@ jobs:
             cp "$source" "$dest"
             chmod 0755 "$dest" || true
             require_file_min_size "$dest" "$min_size"
+            require_symbols "$dest"
+            if [[ "$target" == *windows* ]]; then
+              local pdb_source="${release_dir}/${binary}.pdb"
+              local pdb_dest="${artifact_dir}/${binary}-${target}.pdb"
+              if [[ ! -f "$pdb_source" ]]; then
+                echo "required Windows symbol file is missing: $pdb_source"
+                exit 1
+              fi
+              cp "$pdb_source" "$pdb_dest"
+              require_file_min_size "$pdb_dest" 1000000
+            fi
           }
 
           compress_binary() {
@@ -686,9 +774,7 @@ jobs:
           stage_binary codex 50000000
 
           if [[ "$target" == *linux* ]]; then
-            cp "${release_dir}/bwrap" "$artifact_dir/bwrap-${target}"
-            chmod 0755 "$artifact_dir/bwrap-${target}" || true
-            require_file_min_size "$artifact_dir/bwrap-${target}" 100000
+            stage_binary bwrap 100000
 
             bundle_root="$(mktemp -d)"
             mkdir -p "$bundle_root/codex-resources"
@@ -723,6 +809,7 @@ jobs:
 
           if [[ "$target" == *windows* ]]; then
             require_file_min_size "$artifact_dir/codex-${target}.exe.zip" 30000000
+            require_file_min_size "$artifact_dir/codex-${target}.pdb" 1000000
           fi
           require_file_min_size "$artifact_dir/codex-${target}${suffix}.zst" 30000000
           require_tree_min_size "$artifact_dir" 200000000
@@ -734,27 +821,27 @@ jobs:
           done
 
       - name: Upload codex binary artifact
-        if: ${{ always() && matrix.profile == 'release' && matrix.artifact == true && steps.stage_codex_binary_artifact.outcome == 'success' }}
+        if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) && steps.stage_codex_binary_artifact.outcome == 'success' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: ${{ matrix.target }}
-          path: codex-rs/dist/${{ matrix.target }}/**
+          name: ${{ matrix.target }}-${{ matrix.profile }}
+          path: codex-rs/dist/${{ matrix.target }}-${{ matrix.profile }}/**
           if-no-files-found: error
 
       - name: Upload codex binary failure diagnostics
-        if: ${{ always() && matrix.profile == 'release' && matrix.artifact == true && steps.stage_codex_binary_artifact.outcome != 'success' }}
+        if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) && steps.stage_codex_binary_artifact.outcome != 'success' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: ${{ matrix.target }}-failure-diagnostics
-          path: codex-rs/dist/${{ matrix.target }}/**
+          name: ${{ matrix.target }}-${{ matrix.profile }}-failure-diagnostics
+          path: codex-rs/dist/${{ matrix.target }}-${{ matrix.profile }}/**
           if-no-files-found: error
 
       - name: Verify codex binary artifact build
-        if: ${{ always() && matrix.profile == 'release' && matrix.artifact == true && (steps.build_codex_release_artifacts.outcome != 'success' || steps.stage_codex_binary_artifact.outcome != 'success') }}
+        if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) && (steps.build_codex_artifacts.outcome != 'success' || steps.stage_codex_binary_artifact.outcome != 'success') }}
         shell: bash
         run: |
-          echo "Release artifact build outcome: ${{ steps.build_codex_release_artifacts.outcome }}"
-          echo "Release artifact stage outcome: ${{ steps.stage_codex_binary_artifact.outcome }}"
+          echo "Artifact build outcome: ${{ steps.build_codex_artifacts.outcome }}"
+          echo "Artifact stage outcome: ${{ steps.stage_codex_binary_artifact.outcome }}"
           exit 1
 
       # Save caches explicitly; make non-fatal so cache packaging
@@ -809,12 +896,10 @@ jobs:
       run:
         working-directory: codex-rs
     env:
-      # Speed up repeated builds across CI runs by caching compiled objects, except on
-      # arm64 macOS runners cross-targeting x86_64 where ring/cc-rs can produce
-      # mixed-architecture archives under sccache.
-      USE_SCCACHE: ${{ (startsWith(matrix.runner, 'windows') || (matrix.runner == 'macos-15-xlarge' && matrix.target == 'x86_64-apple-darwin')) && 'false' || 'true' }}
+      USE_SCCACHE: "true"
       CARGO_INCREMENTAL: "0"
       SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_GHA_ENABLED: "on"
 
     strategy:
       fail-fast: false
@@ -905,13 +990,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "${ACTIONS_CACHE_URL:-}" && -n "${ACTIONS_RESULTS_URL:-}" && -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
-            echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
-            echo "Using sccache GitHub backend"
-          else
-            echo "SCCACHE_GHA_ENABLED=off" >> "$GITHUB_ENV"
-            echo "Using sccache local disk cache"
+          if [[ -z "${ACTIONS_CACHE_URL:-}" || -z "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
+            echo "GitHub Actions cache variables are required for sccache GHA backend."
+            echo "ACTIONS_CACHE_URL=${ACTIONS_CACHE_URL:+set}"
+            echo "ACTIONS_RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN:+set}"
+            exit 1
           fi
+          echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          echo "Using sccache GitHub Actions backend"
 
       - name: Enable sccache wrapper
         if: ${{ env.USE_SCCACHE == 'true' }}

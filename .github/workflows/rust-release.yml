@@ -113,6 +113,12 @@ jobs:
             echo "::warning title=Deprecated sign_macos input ignored::Use release_mode=build_unsigned or release_mode=promote_signed instead."
           fi
 
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${RELEASE_MODE}" == "build_unsigned" ]]; then
+            echo "Manual artifact-only build; skipping tag/version validation."
+            echo "::endgroup::"
+            exit 0
+          fi
+
           # 1. Must be a tag and match the regex
           [[ "${GITHUB_REF_TYPE}" == "tag" ]] \
             || { echo "❌  Not a tag push"; exit 1; }
@@ -161,24 +167,28 @@ jobs:
             artifact_name: aarch64-apple-darwin
             binaries: "codex codex-responses-api-proxy"
             build_dmg: "true"
+            runs_on: ""
           - runner: macos-15-xlarge
             target: aarch64-apple-darwin
             bundle: app-server
             artifact_name: aarch64-apple-darwin-app-server
             binaries: "codex-app-server"
             build_dmg: "false"
+            runs_on: ""
           - runner: macos-15-xlarge
             target: x86_64-apple-darwin
             bundle: primary
             artifact_name: x86_64-apple-darwin
             binaries: "codex codex-responses-api-proxy"
             build_dmg: "true"
+            runs_on: ""
           - runner: macos-15-xlarge
             target: x86_64-apple-darwin
             bundle: app-server
             artifact_name: x86_64-apple-darwin-app-server
             binaries: "codex-app-server"
             build_dmg: "false"
+            runs_on: ""
           # Release artifacts intentionally ship MUSL-linked Linux binaries.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
@@ -186,29 +196,43 @@ jobs:
             artifact_name: x86_64-unknown-linux-musl
             binaries: "codex codex-responses-api-proxy bwrap"
             build_dmg: "false"
+            runs_on: ""
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             bundle: app-server
             artifact_name: x86_64-unknown-linux-musl-app-server
             binaries: "codex-app-server"
             build_dmg: "false"
+            runs_on: ""
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             bundle: primary
             artifact_name: aarch64-unknown-linux-musl
             binaries: "codex codex-responses-api-proxy bwrap"
             build_dmg: "false"
+            runs_on: ""
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             bundle: app-server
             artifact_name: aarch64-unknown-linux-musl-app-server
             binaries: "codex-app-server"
             build_dmg: "false"
+            runs_on: ""
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Define build version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+          echo "CODEX_RELEASE_VERSION=${version}" >> "$GITHUB_ENV"
       - name: Print runner specs (Linux)
         if: ${{ runner.os == 'Linux' }}
         shell: bash
@@ -556,7 +580,7 @@ jobs:
             stage-runtime
             "$stage_dir"
             "${GITHUB_WORKSPACE}/codex-rs/target/${{ matrix.target }}/release/codex"
-            --codex-version "${GITHUB_REF_NAME}"
+            --codex-version "${CODEX_RELEASE_VERSION}"
             --platform-tag "$platform_tag"
           )
           if [[ "${{ matrix.target }}" == *linux* ]]; then
@@ -855,6 +879,7 @@ jobs:
     uses: ./.github/workflows/rust-release-windows.yml
     with:
       release-lto: ${{ contains(github.ref_name, '-alpha') && 'thin' || 'fat' }}
+      sign-windows: ${{ github.event_name != 'workflow_dispatch' }}
     secrets: inherit
 
   argument-comment-lint-release-assets:
@@ -882,25 +907,14 @@ jobs:
     if: >-
       ${{
         always() &&
+        github.event_name != 'workflow_dispatch' &&
         needs.tag-check.result == 'success' &&
         (
-          (
-            github.event_name == 'workflow_dispatch' &&
-            inputs.release_mode == 'promote_signed' &&
-            needs.stage-signed-macos.result == 'success' &&
-            needs.build.result == 'skipped' &&
-            needs.build-windows.result == 'skipped' &&
-            needs.argument-comment-lint-release-assets.result == 'skipped' &&
-            needs.zsh-release-assets.result == 'skipped'
-          ) ||
-          (
-            (github.event_name != 'workflow_dispatch' || inputs.release_mode != 'promote_signed') &&
-            needs.build.result == 'success' &&
-            needs.stage-signed-macos.result == 'skipped' &&
-            needs.build-windows.result == 'success' &&
-            needs.argument-comment-lint-release-assets.result == 'success' &&
-            needs.zsh-release-assets.result == 'success'
-          )
+          needs.build.result == 'success' &&
+          needs.stage-signed-macos.result == 'skipped' &&
+          needs.build-windows.result == 'success' &&
+          needs.argument-comment-lint-release-assets.result == 'success' &&
+          needs.zsh-release-assets.result == 'success'
         )
       }}
     name: release
@@ -1180,6 +1194,7 @@ jobs:
           cp scripts/install/install.ps1 dist/install.ps1
 
       - name: Create GitHub Release
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           name: ${{ steps.release_name.outputs.name }}
@@ -1193,7 +1208,7 @@ jobs:
           prerelease: ${{ contains(steps.release_name.outputs.name, '-') }}
 
       - name: Clean up signed promotion handoff assets
-        if: ${{ env.RELEASE_MODE == 'promote_signed' }}
+        if: ${{ github.event_name != 'workflow_dispatch' && env.RELEASE_MODE == 'promote_signed' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1218,7 +1233,7 @@ jobs:
               fi
             done
 
-      - if: ${{ env.SIGN_MACOS == 'true' }}
+      - if: ${{ github.event_name != 'workflow_dispatch' && env.SIGN_MACOS == 'true' }}
         uses: facebook/dotslash-publish-release@9c9ec027515c34db9282a09a25a9cab5880b2c52 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1226,7 +1241,7 @@ jobs:
           tag: ${{ github.ref_name }}
           config: .github/dotslash-config.json
 
-      - if: ${{ env.SIGN_MACOS == 'true' }}
+      - if: ${{ github.event_name != 'workflow_dispatch' && env.SIGN_MACOS == 'true' }}
         uses: facebook/dotslash-publish-release@9c9ec027515c34db9282a09a25a9cab5880b2c52 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1234,7 +1249,7 @@ jobs:
           tag: ${{ github.ref_name }}
           config: .github/dotslash-zsh-config.json
 
-      - if: ${{ env.SIGN_MACOS == 'true' }}
+      - if: ${{ github.event_name != 'workflow_dispatch' && env.SIGN_MACOS == 'true' }}
         uses: facebook/dotslash-publish-release@9c9ec027515c34db9282a09a25a9cab5880b2c52 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1245,7 +1260,7 @@ jobs:
       - name: Trigger developers.openai.com deploy
         # Only trigger the deploy if the release is not a pre-release.
         # The deploy is used to update the developers.openai.com website with the new config schema json file.
-        if: ${{ env.SIGN_MACOS == 'true' && !contains(steps.release_name.outputs.name, '-') }}
+        if: ${{ github.event_name != 'workflow_dispatch' && env.SIGN_MACOS == 'true' && !contains(steps.release_name.outputs.name, '-') }}
         continue-on-error: true
         env:
           DEV_WEBSITE_VERCEL_DEPLOY_HOOK_URL: ${{ secrets.DEV_WEBSITE_VERCEL_DEPLOY_HOOK_URL }}
@@ -1266,6 +1281,7 @@ jobs:
     if: >-
       ${{
         !cancelled() &&
+        github.event_name != 'workflow_dispatch' &&
         needs.release.result == 'success' &&
         needs.release.outputs.should_publish_npm == 'true'
       }}
@@ -1429,6 +1445,7 @@ jobs:
     if: >-
       ${{
         !cancelled() &&
+        github.event_name != 'workflow_dispatch' &&
         needs.release.result == 'success' &&
         needs.release.outputs.should_publish_python_runtime == 'true'
       }}
@@ -1475,6 +1492,7 @@ jobs:
     if: >-
       ${{
         !cancelled() &&
+        github.event_name != 'workflow_dispatch' &&
         needs.release.result == 'success' &&
         needs.release.outputs.sign_macos == 'true' &&
         !contains(needs.release.outputs.version, '-')
@@ -1501,6 +1519,7 @@ jobs:
     if: >-
       ${{
         !cancelled() &&
+        github.event_name != 'workflow_dispatch' &&
         needs.release.result == 'success' &&
         needs.release.outputs.sign_macos == 'true'
       }}

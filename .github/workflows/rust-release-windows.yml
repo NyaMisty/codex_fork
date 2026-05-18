@@ -6,19 +6,22 @@ on:
       release-lto:
         required: true
         type: string
+      sign-windows:
+        required: true
+        type: boolean
     secrets:
       AZURE_TRUSTED_SIGNING_CLIENT_ID:
-        required: true
+        required: false
       AZURE_TRUSTED_SIGNING_TENANT_ID:
-        required: true
+        required: false
       AZURE_TRUSTED_SIGNING_SUBSCRIPTION_ID:
-        required: true
+        required: false
       AZURE_TRUSTED_SIGNING_ENDPOINT:
-        required: true
+        required: false
       AZURE_TRUSTED_SIGNING_ACCOUNT_NAME:
-        required: true
+        required: false
       AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME:
-        required: true
+        required: false
 
 jobs:
   build-windows-binaries:
@@ -44,43 +47,43 @@ jobs:
             bundle: primary
             binaries: "codex codex-responses-api-proxy"
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              - self-hosted
+              - codex-windows-x64
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             bundle: primary
             binaries: "codex codex-responses-api-proxy"
             runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
+              - self-hosted
+              - codex-windows-arm64
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             bundle: helpers
             binaries: "codex-windows-sandbox-setup codex-command-runner"
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              - self-hosted
+              - codex-windows-x64
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             bundle: helpers
             binaries: "codex-windows-sandbox-setup codex-command-runner"
             runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
+              - self-hosted
+              - codex-windows-arm64
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             bundle: app-server
             binaries: "codex-app-server"
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              - self-hosted
+              - codex-windows-x64
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             bundle: app-server
             binaries: "codex-app-server"
             runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
+              - self-hosted
+              - codex-windows-arm64
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -150,6 +153,7 @@ jobs:
         working-directory: codex-rs
     env:
       WINDOWS_BINARIES: "codex codex-responses-api-proxy codex-windows-sandbox-setup codex-command-runner codex-app-server"
+      SIGN_WINDOWS: ${{ inputs.sign-windows }}
 
     strategy:
       fail-fast: false
@@ -158,13 +162,13 @@ jobs:
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              - self-hosted
+              - codex-windows-x64
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
+              - self-hosted
+              - codex-windows-arm64
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -198,6 +202,7 @@ jobs:
           done
 
       - name: Sign Windows binaries with Azure Trusted Signing
+        if: ${{ inputs.sign-windows }}
         uses: ./.github/actions/windows-code-sign
         with:
           target: ${{ matrix.target }}
@@ -224,6 +229,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            codex_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')"
+          else
+            codex_version="${GITHUB_REF_NAME}"
+          fi
 
           case "${{ matrix.target }}" in
             aarch64-pc-windows-msvc)
@@ -249,7 +259,7 @@ jobs:
             stage-runtime \
             "$stage_dir" \
             "${GITHUB_WORKSPACE}/codex-rs/target/${{ matrix.target }}/release/codex.exe" \
-            --codex-version "${GITHUB_REF_NAME}" \
+            --codex-version "$codex_version" \
             --platform-tag "$platform_tag" \
             --resource-binary "${GITHUB_WORKSPACE}/codex-rs/target/${{ matrix.target }}/release/codex-command-runner.exe" \
             --resource-binary "${GITHUB_WORKSPACE}/codex-rs/target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe"
