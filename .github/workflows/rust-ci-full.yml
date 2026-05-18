@@ -170,12 +170,7 @@ jobs:
       run:
         working-directory: codex-rs
     env:
-      # Speed up repeated builds across CI runs by caching compiled objects, except on
-      # arm64 macOS runners cross-targeting x86_64 where ring/cc-rs can produce
-      # mixed-architecture archives under sccache.
-      USE_SCCACHE: ${{ (startsWith(matrix.runner, 'windows') || (matrix.runner == 'macos-15-xlarge' && matrix.target == 'x86_64-apple-darwin')) && 'false' || 'true' }}
       CARGO_INCREMENTAL: "0"
-      SCCACHE_CACHE_SIZE: 10G
       # In rust-ci, representative release-profile checks use thin LTO for faster feedback.
       CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && 'thin' || 'fat' }}
 
@@ -296,48 +291,6 @@ jobs:
           key: cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-${{ steps.lockhash.outputs.hash }}-${{ steps.lockhash.outputs.toolchain_hash }}
           restore-keys: |
             cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-
-
-      # Install sccache and use its GitHub Actions backend directly.
-      - name: Install sccache
-        if: ${{ env.USE_SCCACHE == 'true' }}
-        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
-        with:
-          tool: sccache@0.7.5
-
-      - name: Configure sccache GitHub cache variables
-        if: ${{ env.USE_SCCACHE == 'true' }}
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Configure sccache backend
-        if: ${{ env.USE_SCCACHE == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -n "${ACTIONS_CACHE_URL:-}" && -n "${ACTIONS_RESULTS_URL:-}" && -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
-            echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
-            echo "Using sccache GitHub backend"
-          else
-            echo "SCCACHE_GHA_ENABLED=off" >> "$GITHUB_ENV"
-            echo "Using sccache local disk cache"
-          fi
-
-      - name: Enable sccache wrapper
-        if: ${{ env.USE_SCCACHE == 'true' }}
-        shell: bash
-        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-
-      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
-        name: Disable sccache wrapper (musl)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          echo "RUSTC_WORKSPACE_WRAPPER=" >> "$GITHUB_ENV"
 
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Prepare APT cache directories (musl)
@@ -775,23 +728,6 @@ jobs:
             ${{ github.workspace }}/.cargo-home/git/db/
           key: cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-${{ steps.lockhash.outputs.hash }}-${{ steps.lockhash.outputs.toolchain_hash }}
 
-      - name: sccache stats
-        if: always() && env.USE_SCCACHE == 'true'
-        continue-on-error: true
-        run: sccache --show-stats || true
-
-      - name: sccache summary
-        if: always() && env.USE_SCCACHE == 'true'
-        shell: bash
-        run: |
-          {
-            echo "### sccache stats — ${{ matrix.target }} (${{ matrix.profile }})";
-            echo;
-            echo '```';
-            sccache --show-stats || true;
-            echo '```';
-          } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Save APT cache (musl)
         if: always() && !cancelled() && (matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl') && steps.cache_apt_restore.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -809,12 +745,7 @@ jobs:
       run:
         working-directory: codex-rs
     env:
-      # Speed up repeated builds across CI runs by caching compiled objects, except on
-      # arm64 macOS runners cross-targeting x86_64 where ring/cc-rs can produce
-      # mixed-architecture archives under sccache.
-      USE_SCCACHE: ${{ (startsWith(matrix.runner, 'windows') || (matrix.runner == 'macos-15-xlarge' && matrix.target == 'x86_64-apple-darwin')) && 'false' || 'true' }}
       CARGO_INCREMENTAL: "0"
-      SCCACHE_CACHE_SIZE: 10G
 
     strategy:
       fail-fast: false
@@ -885,39 +816,6 @@ jobs:
           restore-keys: |
             cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-
 
-      - name: Install sccache
-        if: ${{ env.USE_SCCACHE == 'true' }}
-        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
-        with:
-          tool: sccache@0.7.5
-
-      - name: Configure sccache GitHub cache variables
-        if: ${{ env.USE_SCCACHE == 'true' }}
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Configure sccache backend
-        if: ${{ env.USE_SCCACHE == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -n "${ACTIONS_CACHE_URL:-}" && -n "${ACTIONS_RESULTS_URL:-}" && -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
-            echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
-            echo "Using sccache GitHub backend"
-          else
-            echo "SCCACHE_GHA_ENABLED=off" >> "$GITHUB_ENV"
-            echo "Using sccache local disk cache"
-          fi
-
-      - name: Enable sccache wrapper
-        if: ${{ env.USE_SCCACHE == 'true' }}
-        shell: bash
-        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
           tool: nextest
@@ -950,7 +848,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [[ '${{ matrix.remote_env }}' == 'true' ]]; then
             cargo nextest run \
               --no-fail-fast \
@@ -990,23 +887,6 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
           key: cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-${{ steps.lockhash.outputs.hash }}-${{ steps.lockhash.outputs.toolchain_hash }}
-
-      - name: sccache stats
-        if: always() && env.USE_SCCACHE == 'true'
-        continue-on-error: true
-        run: sccache --show-stats || true
-
-      - name: sccache summary
-        if: always() && env.USE_SCCACHE == 'true'
-        shell: bash
-        run: |
-          {
-            echo "### sccache stats — ${{ matrix.target }} (tests)";
-            echo;
-            echo '```';
-            sccache --show-stats || true;
-            echo '```';
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Tear down remote test env
         if: ${{ always() && runner.os == 'Linux' && matrix.remote_env == 'true' }}
@@ -1057,8 +937,3 @@ jobs:
           if [[ '${{ needs.tests.result }}' != 'success' ]]; then
             echo 'tests failed; ignoring per fork rust-ci-full artifact policy'
           fi
-
-      - name: sccache summary note
-        if: always()
-        run: |
-          echo "Per-job sccache stats are attached to each matrix job's Step Summary."
