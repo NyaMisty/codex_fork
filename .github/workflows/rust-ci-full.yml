@@ -6,7 +6,6 @@ on:
       - "**full-ci**"
   workflow_dispatch:
 
-# CI builds in debug (dev) for faster signal.
 env:
   # Cargo's libgit2 transport has been flaky on macOS when fetching git
   # dependencies with nested submodules. Use the system git CLI, which has
@@ -442,11 +441,11 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Install DotSlash for release artifact compression
-        if: ${{ matrix.profile == 'release' && runner.os == 'Windows' }}
+        if: ${{ matrix.profile == 'release' && matrix.artifact == true && runner.os == 'Windows' }}
         uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
 
       - name: Ensure zstd for release artifact compression
-        if: ${{ matrix.profile == 'release' && runner.os == 'macOS' }}
+        if: ${{ matrix.profile == 'release' && matrix.artifact == true && runner.os == 'macOS' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -455,12 +454,16 @@ jobs:
           fi
           zstd -V
 
-      - name: cargo clippy
-        if: ${{ matrix.profile != 'release' || matrix.artifact != true }}
-        run: cargo clippy --target ${{ matrix.target }} --tests --profile ${{ matrix.profile }} --timings -- -D warnings
+      - name: cargo clippy (debug/dev)
+        if: ${{ matrix.profile == 'dev' }}
+        run: cargo clippy --target ${{ matrix.target }} --tests --profile dev --timings -- -D warnings
+
+      - name: cargo clippy (release)
+        if: ${{ matrix.profile == 'release' && matrix.artifact != true }}
+        run: cargo clippy --target ${{ matrix.target }} --tests --release --timings -- -D warnings
 
       - name: Upload Cargo timings (clippy)
-        if: ${{ always() && (matrix.profile != 'release' || matrix.artifact != true) }}
+        if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact != true)) }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: cargo-timings-rust-ci-clippy-${{ matrix.target }}-${{ matrix.profile }}
@@ -468,7 +471,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Build codex release artifacts
-        if: ${{ matrix.artifact == true }}
+        if: ${{ matrix.profile == 'release' && matrix.artifact == true }}
         shell: bash
         run: |
           set -euo pipefail
@@ -522,7 +525,7 @@ jobs:
 
       - name: Stage codex binary artifact
         id: stage_codex_binary_artifact
-        if: ${{ matrix.artifact == true }}
+        if: ${{ matrix.profile == 'release' && matrix.artifact == true }}
         shell: bash
         run: |
           set -euo pipefail
@@ -732,7 +735,7 @@ jobs:
           done
 
       - name: Upload codex binary artifact
-        if: ${{ matrix.artifact == true && steps.stage_codex_binary_artifact.outcome == 'success' }}
+        if: ${{ matrix.profile == 'release' && matrix.artifact == true && steps.stage_codex_binary_artifact.outcome == 'success' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: ${{ matrix.target }}
