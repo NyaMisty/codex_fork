@@ -170,7 +170,16 @@ jobs:
       run:
         working-directory: codex-rs
     env:
+      USE_SCCACHE: "true"
       CARGO_INCREMENTAL: "0"
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_PROFILE_DEV_DEBUG: "full"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'windows') && 'packed' || 'off' }}
+      CARGO_PROFILE_DEV_STRIP: "none"
+      CARGO_PROFILE_RELEASE_DEBUG: "full"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'windows') && 'packed' || 'off' }}
+      CARGO_PROFILE_RELEASE_STRIP: "none"
       # In rust-ci, representative release-profile checks use thin LTO for faster feedback.
       CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && 'thin' || 'fat' }}
 
@@ -292,6 +301,72 @@ jobs:
           restore-keys: |
             cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-
 
+      # Install sccache and use its GitHub Actions backend directly.
+      - name: Install sccache
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache@0.15.0
+
+      - name: Configure sccache GitHub cache variables
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', 'on');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure sccache backend
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${ACTIONS_RESULTS_URL:-}" || -z "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
+            echo "GitHub Actions cache variables are required for sccache GHA backend."
+            echo "ACTIONS_RESULTS_URL=${ACTIONS_RESULTS_URL:+set}"
+            echo "ACTIONS_RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN:+set}"
+            exit 1
+          fi
+          cache_scope="${GITHUB_REF_NAME:-main}"
+          cache_scope="${cache_scope//[^A-Za-z0-9_.-]/-}"
+          cache_prefix="sccache-${cache_scope}-${{ matrix.target }}-${{ matrix.profile }}"
+          main_cache_prefix="sccache-main-${{ matrix.target }}-${{ matrix.profile }}"
+          export ACTIONS_CACHE_SERVICE_V2=on
+          export SCCACHE_GHA_ENABLED=true
+          export SCCACHE_GHA_CACHE_URL="${ACTIONS_RESULTS_URL}"
+          export SCCACHE_GHA_RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN}"
+          export SCCACHE_GHA_CACHE_TO="${cache_prefix}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export SCCACHE_GHA_CACHE_FROM="${SCCACHE_GHA_CACHE_TO},${cache_prefix}-,${cache_prefix},${main_cache_prefix}-,${main_cache_prefix}"
+          export SCCACHE_ERROR_LOG="${RUNNER_TEMP}/sccache-${{ matrix.target }}-${{ matrix.profile }}.log"
+          {
+            echo "ACTIONS_CACHE_SERVICE_V2=${ACTIONS_CACHE_SERVICE_V2}"
+            echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+            echo "SCCACHE_GHA_CACHE_URL=${SCCACHE_GHA_CACHE_URL}"
+            echo "SCCACHE_GHA_RUNTIME_TOKEN=${SCCACHE_GHA_RUNTIME_TOKEN}"
+            echo "SCCACHE_GHA_CACHE_TO=${SCCACHE_GHA_CACHE_TO}"
+            echo "SCCACHE_GHA_CACHE_FROM=${SCCACHE_GHA_CACHE_FROM}"
+            echo "SCCACHE_ERROR_LOG=${SCCACHE_ERROR_LOG}"
+          } >> "$GITHUB_ENV"
+          echo "Using sccache GitHub Actions backend"
+
+          for attempt in 1 2 3 4 5; do
+            if sccache --start-server; then
+              sccache --show-stats || true
+              exit 0
+            fi
+            sleep_seconds=$((attempt * 15))
+            echo "sccache GHA backend startup failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+            sleep "$sleep_seconds"
+          done
+          echo "sccache GHA backend failed to start after retries"
+          exit 1
+
+      - name: Enable sccache wrapper
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Prepare APT cache directories (musl)
         shell: bash
@@ -314,6 +389,7 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.14.0
+          use-cache: false
 
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Install musl build tools
@@ -342,11 +418,31 @@ jobs:
           if [[ -n "${ubsan}" ]]; then
             export LD_PRELOAD="${ubsan}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
           fi
+          if command -v sccache >/dev/null 2>&1; then
+            exec sccache "\$@"
+          fi
           exec "\$1" "\${@:2}"
           EOF
           chmod +x "${wrapper}"
           echo "RUSTC_WRAPPER=${wrapper}" >> "$GITHUB_ENV"
           echo "RUSTC_WORKSPACE_WRAPPER=" >> "$GITHUB_ENV"
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --stop-server || true
+            if [[ -n "${ubsan}" ]]; then
+              export LD_PRELOAD="${ubsan}${LD_PRELOAD:+:${LD_PRELOAD}}"
+            fi
+            for attempt in 1 2 3 4 5; do
+              if sccache --start-server; then
+                sccache --show-stats || true
+                exit 0
+              fi
+              sleep_seconds=$((attempt * 15))
+              echo "sccache GHA backend restart failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+              sleep "$sleep_seconds"
+            done
+            echo "sccache GHA backend failed to restart after UBSan wrapper setup"
+            exit 1
+          fi
 
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Clear sanitizer flags (musl)
@@ -380,8 +476,18 @@ jobs:
 
           cflags="$(sanitize_flags "${CFLAGS-}")"
           cxxflags="$(sanitize_flags "${CXXFLAGS-}")"
+          cflags="${cflags:+${cflags} }-fno-sanitize=undefined"
+          cxxflags="${cxxflags:+${cxxflags} }-fno-sanitize=undefined"
+          target_cflags_var="CFLAGS_${{ matrix.target }}"
+          target_cflags_var="${target_cflags_var//-/_}"
+          target_cxxflags_var="CXXFLAGS_${{ matrix.target }}"
+          target_cxxflags_var="${target_cxxflags_var//-/_}"
           echo "CFLAGS=${cflags}" >> "$GITHUB_ENV"
           echo "CXXFLAGS=${cxxflags}" >> "$GITHUB_ENV"
+          echo "${target_cflags_var}=${cflags}" >> "$GITHUB_ENV"
+          echo "${target_cxxflags_var}=${cxxflags}" >> "$GITHUB_ENV"
+          echo "CMAKE_C_FLAGS=${cflags}" >> "$GITHUB_ENV"
+          echo "CMAKE_CXX_FLAGS=${cxxflags}" >> "$GITHUB_ENV"
 
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' }}
         name: Configure musl rusty_v8 artifact overrides and verify checksums
@@ -389,12 +495,12 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: Install DotSlash for release artifact compression
-        if: ${{ matrix.profile == 'release' && matrix.artifact == true && runner.os == 'Windows' }}
+      - name: Install DotSlash for codex artifact compression
+        if: ${{ (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) && runner.os == 'Windows' }}
         uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
 
-      - name: Ensure zstd for release artifact compression
-        if: ${{ matrix.profile == 'release' && matrix.artifact == true && runner.os == 'macOS' }}
+      - name: Ensure zstd for codex artifact compression
+        if: ${{ (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) && runner.os == 'macOS' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -419,75 +525,129 @@ jobs:
           path: codex-rs/target/**/cargo-timings/cargo-timing.html
           if-no-files-found: warn
 
-      - name: Build codex release artifacts
-        id: build_codex_release_artifacts
-        if: ${{ matrix.profile == 'release' && matrix.artifact == true }}
+      - name: Build codex artifacts
+        id: build_codex_artifacts
+        if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) }}
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
+          profile="${{ matrix.profile }}"
           release_target_dir="${PWD}/target"
+          profile_args=()
+          profile_dir="debug"
+          case "$profile" in
+            dev)
+              profile_args=(--profile dev)
+              profile_dir="debug"
+              ;;
+            release)
+              profile_args=(--release)
+              profile_dir="release"
+              ;;
+            *)
+              echo "unsupported profile: $profile"
+              exit 1
+              ;;
+          esac
 
           cargo_with_timeout() {
             # Keep a GitHub-hosted runner from being externally killed mid-build
             # before this step can fail normally and print artifact diagnostics.
-            if command -v timeout >/dev/null 2>&1 && timeout --help 2>&1 | grep -q -- '--foreground'; then
-              timeout --foreground 330m cargo "$@"
-            else
-              cargo "$@"
-            fi
+            local attempt
+            local status
+            for attempt in 1 2; do
+              if command -v timeout >/dev/null 2>&1 && timeout --help 2>&1 | grep -q -- '--foreground'; then
+                if timeout --foreground 330m cargo "$@"; then
+                  return 0
+                else
+                  status=$?
+                fi
+              else
+                if cargo "$@"; then
+                  return 0
+                else
+                  status=$?
+                fi
+              fi
+              if (( attempt == 1 )) && [[ "${USE_SCCACHE:-}" == "true" ]] && command -v sccache >/dev/null 2>&1; then
+                echo "cargo command failed with status ${status}; restarting sccache and retrying once"
+                sccache --stop-server || true
+                sccache --start-server || true
+                sccache --show-stats || true
+                continue
+              fi
+              return "$status"
+            done
           }
 
-          build_args="--bin codex"
-          built_bins="codex"
+          build_args=(--bin codex)
+          built_bins=(codex)
           suffix=""
           if [[ "$target" == *windows* ]]; then
             suffix=".exe"
           fi
 
           if [[ "$target" == *linux* ]]; then
-            cargo_with_timeout build --target "$target" --release --locked --timings --bin bwrap
-            bwrap_path="${release_target_dir}/${target}/release/bwrap"
+            cargo_with_timeout build --target "$target" "${profile_args[@]}" --locked --timings --bin bwrap
+            bwrap_path="${release_target_dir}/${target}/${profile_dir}/bwrap"
             if [[ ! -f "$bwrap_path" ]]; then
               echo "bwrap binary ${bwrap_path} not found"
               exit 1
             fi
             export CODEX_BWRAP_SHA256="$(sha256sum "$bwrap_path" | awk '{print $1}')"
-            built_bins="${built_bins} bwrap"
+            built_bins+=(bwrap)
           fi
 
           if [[ "$target" == *windows* ]]; then
-            build_args="${build_args} --bin codex-command-runner --bin codex-windows-sandbox-setup"
-            built_bins="${built_bins} codex-command-runner codex-windows-sandbox-setup"
+            build_args+=(--bin codex-command-runner --bin codex-windows-sandbox-setup)
+            built_bins+=(codex-command-runner codex-windows-sandbox-setup)
           fi
 
-          cargo_with_timeout build --target "$target" --release --locked --timings ${build_args}
+          cargo_with_timeout build --target "$target" "${profile_args[@]}" --locked --timings "${build_args[@]}"
 
-          echo "Built release binary sizes:"
-          for binary in ${built_bins}; do
-            path="${release_target_dir}/${target}/release/${binary}${suffix}"
+          echo "Built ${profile} binary sizes:"
+          for binary in "${built_bins[@]}"; do
+            path="${release_target_dir}/${target}/${profile_dir}/${binary}${suffix}"
             if [[ -f "$path" ]]; then
               printf '%12s  %s\n' "$(wc -c < "$path" | tr -d '[:space:]')" "$path"
             else
               echo "missing: $path"
             fi
+            if [[ "$target" == *windows* && -f "${release_target_dir}/${target}/${profile_dir}/${binary}.pdb" ]]; then
+              printf '%12s  %s\n' "$(wc -c < "${release_target_dir}/${target}/${profile_dir}/${binary}.pdb" | tr -d '[:space:]')" "${release_target_dir}/${target}/${profile_dir}/${binary}.pdb"
+            fi
           done
 
       - name: Stage codex binary artifact
         id: stage_codex_binary_artifact
-        if: ${{ always() && matrix.profile == 'release' && matrix.artifact == true }}
+        if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) }}
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
+          profile="${{ matrix.profile }}"
           suffix=""
           if [[ "$target" == *windows* ]]; then
             suffix=".exe"
           fi
-          artifact_dir="dist/${target}"
-          release_dir="target/${target}/release"
+          profile_dir="debug"
+          case "$profile" in
+            dev)
+              profile_dir="debug"
+              ;;
+            release)
+              profile_dir="release"
+              ;;
+            *)
+              echo "unsupported profile: $profile"
+              exit 1
+              ;;
+          esac
+          artifact_dir="dist/${target}-${profile}"
+          release_dir="target/${target}/${profile_dir}"
           repo_root="$PWD"
           rm -rf "$artifact_dir"
           mkdir -p "$artifact_dir"
@@ -562,9 +722,45 @@ jobs:
             fi
           }
 
+          require_symbols() {
+            local file="$1"
+            if [[ "$target" == *windows* ]]; then
+              return 0
+            fi
+
+            if [[ "$target" == *apple-darwin* ]]; then
+              return 0
+            fi
+
+            if command -v file >/dev/null 2>&1; then
+              file_output="$(file "$file")"
+              echo "$file_output"
+              if grep -qi 'stripped' <<<"$file_output" && ! grep -qi 'not stripped' <<<"$file_output"; then
+                echo "artifact binary is stripped but symbols are required: $file"
+                exit 1
+              fi
+            fi
+
+            if command -v readelf >/dev/null 2>&1; then
+              if ! readelf -S "$file" 2>/dev/null | grep -q '\.debug_info'; then
+                echo "artifact binary is missing .debug_info: $file"
+                exit 1
+              fi
+            elif command -v objdump >/dev/null 2>&1; then
+              if ! objdump -h "$file" 2>/dev/null | grep -q '\.debug_info'; then
+                echo "artifact binary is missing .debug_info: $file"
+                exit 1
+              fi
+            else
+              echo "No tool available to verify debug symbols for $file"
+              exit 1
+            fi
+          }
+
           write_manifest() {
             {
               echo "target: ${target}"
+              echo "profile: ${profile}"
               echo "release_dir: ${release_dir}"
               echo "artifact_dir: ${artifact_dir}"
               echo
@@ -582,6 +778,90 @@ jobs:
             ) > "$artifact_dir/SHA256SUMS.txt"
           }
 
+          require_macos_dsym() {
+            local dsym_dir="$1"
+            if [[ ! -d "$dsym_dir" ]]; then
+              echo "required macOS dSYM bundle is missing: $dsym_dir"
+              return 1
+            fi
+            local dsym_size
+            dsym_size="$(tree_size "$dsym_dir")"
+            if (( dsym_size < 1000000 )); then
+              echo "macOS dSYM bundle $dsym_dir totals only ${dsym_size} bytes; expected at least 1000000 bytes"
+              return 1
+            fi
+            local dwarf_file
+            dwarf_file="$(find "$dsym_dir/Contents/Resources/DWARF" -maxdepth 1 -type f -print -quit 2>/dev/null || true)"
+            if [[ -z "$dwarf_file" ]]; then
+              echo "macOS dSYM bundle does not contain a DWARF file: $dsym_dir"
+              return 1
+            fi
+            if ! command -v dwarfdump >/dev/null 2>&1; then
+              echo "No tool available to verify macOS dSYM debug info for $dsym_dir"
+              return 1
+            fi
+            if ! dwarfdump --debug-info "$dwarf_file" 2>/dev/null | grep -q 'DW_TAG_compile_unit'; then
+              echo "macOS dSYM is missing DWARF debug info: $dsym_dir"
+              return 1
+            fi
+          }
+
+          has_macos_debug_info() {
+            local file="$1"
+            command -v dwarfdump >/dev/null 2>&1 || return 1
+            dwarfdump --debug-info "$file" 2>/dev/null | grep -q 'DW_TAG_compile_unit'
+          }
+
+          compress_directory() {
+            local dir="$1"
+            local base
+            local parent
+            base="$(basename "$dir")"
+            parent="$(dirname "$dir")"
+            tar -C "$parent" -czf "$artifact_dir/${base}.tar.gz" "$base"
+            tar -C "$parent" -cf - "$base" | zstd -f -T0 -19 -o "$artifact_dir/${base}.tar.zst"
+          }
+
+          stage_macos_dsym() {
+            local source="$1"
+            local dest="$2"
+            local source_dir
+            local source_base
+            source_dir="$(dirname "$source")"
+            source_base="$(basename "$source")"
+            local dsym_dest="${dest}.dSYM"
+            rm -rf "$dsym_dest"
+
+            local dsym_source=""
+            dsym_source="$(find "$source_dir" -maxdepth 2 -type d -name "${source_base}*.dSYM" -print -quit 2>/dev/null || true)"
+            if [[ -n "$dsym_source" ]]; then
+              echo "Found macOS dSYM bundle: $dsym_source"
+              cp -R "$dsym_source" "$dsym_dest"
+            elif command -v dsymutil >/dev/null 2>&1; then
+              if ! dsymutil "$source" -o "$dsym_dest"; then
+                echo "dsymutil could not create a dSYM bundle for $source"
+                rm -rf "$dsym_dest"
+              fi
+            else
+              echo "macOS dSYM bundle is missing and dsymutil is unavailable for $source"
+            fi
+
+            if [[ -d "$dsym_dest" ]] && require_macos_dsym "$dsym_dest"; then
+              compress_directory "$dsym_dest"
+              rm -rf "$dsym_dest"
+              return 0
+            fi
+            rm -rf "$dsym_dest"
+
+            if has_macos_debug_info "$dest" || has_macos_debug_info "$source"; then
+              echo "macOS binary contains embedded DWARF debug info; no separate dSYM bundle was produced."
+              return 0
+            fi
+
+            echo "required macOS debug symbols are missing: no dSYM bundle and no embedded DWARF debug info for $dest"
+            exit 1
+          }
+
           stage_binary() {
             local binary="$1"
             local min_size="$2"
@@ -594,6 +874,30 @@ jobs:
             cp "$source" "$dest"
             chmod 0755 "$dest" || true
             require_file_min_size "$dest" "$min_size"
+            require_symbols "$dest"
+            if [[ "$target" == *apple-darwin* ]]; then
+              stage_macos_dsym "$source" "$dest"
+            elif [[ "$target" == *windows* ]]; then
+              local pdb_source=""
+              local candidate
+              for candidate in \
+                "${release_dir}/${binary}.pdb" \
+                "${release_dir}/deps/${binary}.pdb" \
+                "${release_dir}/deps/${binary//-/_}.pdb" \
+                "${release_dir}/${binary//-/_}.pdb"; do
+                if [[ -f "$candidate" ]]; then
+                  pdb_source="$candidate"
+                  break
+                fi
+              done
+              local pdb_dest="${artifact_dir}/${binary}-${target}.pdb"
+              if [[ -z "$pdb_source" ]]; then
+                echo "required Windows symbol file is missing: $pdb_source"
+                exit 1
+              fi
+              cp "$pdb_source" "$pdb_dest"
+              require_file_min_size "$pdb_dest" 1000000
+            fi
           }
 
           compress_binary() {
@@ -639,9 +943,7 @@ jobs:
           stage_binary codex 50000000
 
           if [[ "$target" == *linux* ]]; then
-            cp "${release_dir}/bwrap" "$artifact_dir/bwrap-${target}"
-            chmod 0755 "$artifact_dir/bwrap-${target}" || true
-            require_file_min_size "$artifact_dir/bwrap-${target}" 100000
+            stage_binary bwrap 100000
 
             bundle_root="$(mktemp -d)"
             mkdir -p "$bundle_root/codex-resources"
@@ -676,6 +978,7 @@ jobs:
 
           if [[ "$target" == *windows* ]]; then
             require_file_min_size "$artifact_dir/codex-${target}.exe.zip" 30000000
+            require_file_min_size "$artifact_dir/codex-${target}.pdb" 1000000
           fi
           require_file_min_size "$artifact_dir/codex-${target}${suffix}.zst" 30000000
           require_tree_min_size "$artifact_dir" 200000000
@@ -687,27 +990,27 @@ jobs:
           done
 
       - name: Upload codex binary artifact
-        if: ${{ always() && matrix.profile == 'release' && matrix.artifact == true && steps.stage_codex_binary_artifact.outcome == 'success' }}
+        if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) && steps.stage_codex_binary_artifact.outcome == 'success' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: ${{ matrix.target }}
-          path: codex-rs/dist/${{ matrix.target }}/**
+          name: ${{ matrix.target }}-${{ matrix.profile }}
+          path: codex-rs/dist/${{ matrix.target }}-${{ matrix.profile }}/**
           if-no-files-found: error
 
       - name: Upload codex binary failure diagnostics
-        if: ${{ always() && matrix.profile == 'release' && matrix.artifact == true && steps.stage_codex_binary_artifact.outcome != 'success' }}
+        if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) && steps.stage_codex_binary_artifact.outcome != 'success' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: ${{ matrix.target }}-failure-diagnostics
-          path: codex-rs/dist/${{ matrix.target }}/**
+          name: ${{ matrix.target }}-${{ matrix.profile }}-failure-diagnostics
+          path: codex-rs/dist/${{ matrix.target }}-${{ matrix.profile }}/**
           if-no-files-found: error
 
       - name: Verify codex binary artifact build
-        if: ${{ always() && matrix.profile == 'release' && matrix.artifact == true && (steps.build_codex_release_artifacts.outcome != 'success' || steps.stage_codex_binary_artifact.outcome != 'success') }}
+        if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact == true)) && (steps.build_codex_artifacts.outcome != 'success' || steps.stage_codex_binary_artifact.outcome != 'success') }}
         shell: bash
         run: |
-          echo "Release artifact build outcome: ${{ steps.build_codex_release_artifacts.outcome }}"
-          echo "Release artifact stage outcome: ${{ steps.stage_codex_binary_artifact.outcome }}"
+          echo "Artifact build outcome: ${{ steps.build_codex_artifacts.outcome }}"
+          echo "Artifact stage outcome: ${{ steps.stage_codex_binary_artifact.outcome }}"
           exit 1
 
       # Save caches explicitly; make non-fatal so cache packaging
@@ -728,6 +1031,45 @@ jobs:
             ${{ github.workspace }}/.cargo-home/git/db/
           key: cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-${{ steps.lockhash.outputs.hash }}-${{ steps.lockhash.outputs.toolchain_hash }}
 
+      - name: sccache stats
+        if: always() && env.USE_SCCACHE == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          sccache --show-stats || true
+          if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+            echo "sccache error log tail:"
+            tail -200 "${SCCACHE_ERROR_LOG}" || true
+          fi
+
+      - name: sccache summary
+        if: always() && env.USE_SCCACHE == 'true'
+        shell: bash
+        run: |
+          {
+            echo "### sccache stats — ${{ matrix.target }} (${{ matrix.profile }})";
+            echo;
+            echo '```';
+            sccache --show-stats || true;
+            echo '```';
+            if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+              echo;
+              echo "#### sccache error log tail";
+              echo;
+              echo '```';
+              tail -200 "${SCCACHE_ERROR_LOG}" || true;
+              echo '```';
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare APT cache for save (musl)
+        if: always() && !cancelled() && (matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /var/cache/apt/archives/partial
+          sudo chown -R "$USER:$USER" /var/cache/apt
+
       - name: Save APT cache (musl)
         if: always() && !cancelled() && (matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl') && steps.cache_apt_restore.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -740,12 +1082,14 @@ jobs:
   tests:
     name: Tests — ${{ matrix.runner }} - ${{ matrix.target }}${{ matrix.remote_env == 'true' && ' (remote)' || '' }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
-    continue-on-error: true
     defaults:
       run:
         working-directory: codex-rs
     env:
+      USE_SCCACHE: "true"
       CARGO_INCREMENTAL: "0"
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_GHA_ENABLED: "true"
 
     strategy:
       fail-fast: false
@@ -816,6 +1160,71 @@ jobs:
           restore-keys: |
             cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-
 
+      - name: Install sccache
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache@0.15.0
+
+      - name: Configure sccache GitHub cache variables
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', 'on');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure sccache backend
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${ACTIONS_RESULTS_URL:-}" || -z "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
+            echo "GitHub Actions cache variables are required for sccache GHA backend."
+            echo "ACTIONS_RESULTS_URL=${ACTIONS_RESULTS_URL:+set}"
+            echo "ACTIONS_RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN:+set}"
+            exit 1
+          fi
+          cache_scope="${GITHUB_REF_NAME:-main}"
+          cache_scope="${cache_scope//[^A-Za-z0-9_.-]/-}"
+          cache_prefix="sccache-${cache_scope}-${{ matrix.target }}-${{ matrix.profile }}"
+          main_cache_prefix="sccache-main-${{ matrix.target }}-${{ matrix.profile }}"
+          export ACTIONS_CACHE_SERVICE_V2=on
+          export SCCACHE_GHA_ENABLED=true
+          export SCCACHE_GHA_CACHE_URL="${ACTIONS_RESULTS_URL}"
+          export SCCACHE_GHA_RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN}"
+          export SCCACHE_GHA_CACHE_TO="${cache_prefix}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export SCCACHE_GHA_CACHE_FROM="${SCCACHE_GHA_CACHE_TO},${cache_prefix}-,${cache_prefix},${main_cache_prefix}-,${main_cache_prefix}"
+          export SCCACHE_ERROR_LOG="${RUNNER_TEMP}/sccache-${{ matrix.target }}-tests.log"
+          {
+            echo "ACTIONS_CACHE_SERVICE_V2=${ACTIONS_CACHE_SERVICE_V2}"
+            echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+            echo "SCCACHE_GHA_CACHE_URL=${SCCACHE_GHA_CACHE_URL}"
+            echo "SCCACHE_GHA_RUNTIME_TOKEN=${SCCACHE_GHA_RUNTIME_TOKEN}"
+            echo "SCCACHE_GHA_CACHE_TO=${SCCACHE_GHA_CACHE_TO}"
+            echo "SCCACHE_GHA_CACHE_FROM=${SCCACHE_GHA_CACHE_FROM}"
+            echo "SCCACHE_ERROR_LOG=${SCCACHE_ERROR_LOG}"
+          } >> "$GITHUB_ENV"
+          echo "Using sccache GitHub Actions backend"
+
+          for attempt in 1 2 3 4 5; do
+            if sccache --start-server; then
+              sccache --show-stats || true
+              exit 0
+            fi
+            sleep_seconds=$((attempt * 15))
+            echo "sccache GHA backend startup failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+            sleep "$sleep_seconds"
+          done
+          echo "sccache GHA backend failed to start after retries"
+          exit 1
+
+      - name: Enable sccache wrapper
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
           tool: nextest
@@ -844,10 +1253,10 @@ jobs:
 
       - name: tests
         id: test
-        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
+
           if [[ '${{ matrix.remote_env }}' == 'true' ]]; then
             cargo nextest run \
               --no-fail-fast \
@@ -888,6 +1297,37 @@ jobs:
             ~/.cargo/git/db/
           key: cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-${{ steps.lockhash.outputs.hash }}-${{ steps.lockhash.outputs.toolchain_hash }}
 
+      - name: sccache stats
+        if: always() && env.USE_SCCACHE == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          sccache --show-stats || true
+          if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+            echo "sccache error log tail:"
+            tail -200 "${SCCACHE_ERROR_LOG}" || true
+          fi
+
+      - name: sccache summary
+        if: always() && env.USE_SCCACHE == 'true'
+        shell: bash
+        run: |
+          {
+            echo "### sccache stats — ${{ matrix.target }} (tests)";
+            echo;
+            echo '```';
+            sccache --show-stats || true;
+            echo '```';
+            if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+              echo;
+              echo "#### sccache error log tail";
+              echo;
+              echo '```';
+              tail -200 "${SCCACHE_ERROR_LOG}" || true;
+              echo '```';
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Tear down remote test env
         if: ${{ always() && runner.os == 'Linux' && matrix.remote_env == 'true' }}
         shell: bash
@@ -901,9 +1341,10 @@ jobs:
           STEPS_TEST_OUTCOME: ${{ steps.test.outcome }}
 
       - name: verify tests passed
-        if: steps.test.outcome == 'failure'
+        if: ${{ failure() && steps.test.outcome == 'failure' }}
         run: |
-          echo "Tests failed. See logs for details. Ignoring per fork rust-ci-full artifact policy."
+          echo "Tests failed. See logs for details."
+          exit 1
 
   # --- Gatherer job for the full post-merge workflow --------------------------
   results:
@@ -934,6 +1375,9 @@ jobs:
           [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }
           [[ '${{ needs.cargo_shear.result }}' == 'success' ]] || { echo 'cargo_shear failed'; exit 1; }
           [[ '${{ needs.lint_build.result }}' == 'success' ]] || { echo 'lint_build failed'; exit 1; }
-          if [[ '${{ needs.tests.result }}' != 'success' ]]; then
-            echo 'tests failed; ignoring per fork rust-ci-full artifact policy'
-          fi
+          [[ '${{ needs.tests.result }}' == 'success' ]] || { echo 'tests failed'; exit 1; }
+
+      - name: sccache summary note
+        if: always()
+        run: |
+          echo "Per-job sccache stats are attached to each matrix job's Step Summary."
