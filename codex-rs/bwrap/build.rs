@@ -58,7 +58,10 @@ fn try_build_bwrap() -> Result<(), String> {
         .include(&src_dir)
         .define("_GNU_SOURCE", None)
         // Rename `main` so the Rust wrapper can expose the Cargo-built binary.
-        .define("main", Some("bwrap_main"));
+        .define("main", Some("bwrap_main"))
+        // Zig cc may add UBSan instrumentation for debug-style musl C builds.
+        // The standalone bwrap archive is linked by Rust without a UBSan runtime.
+        .flag_if_supported("-fno-sanitize=undefined");
     for include_path in libcap.include_paths {
         // Use -idirafter so target sysroot headers win (musl cross builds),
         // while still allowing libcap headers from the host toolchain.

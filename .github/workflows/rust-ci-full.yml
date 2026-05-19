@@ -410,6 +410,9 @@ jobs:
           if [[ -n "${ubsan}" ]]; then
             export LD_PRELOAD="${ubsan}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
           fi
+          if command -v sccache >/dev/null 2>&1; then
+            exec sccache "\$@"
+          fi
           exec "\$1" "\${@:2}"
           EOF
           chmod +x "${wrapper}"
