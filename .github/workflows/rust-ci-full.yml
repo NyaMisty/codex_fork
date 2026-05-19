@@ -55,6 +55,7 @@ jobs:
       DYLINT_LINK_VERSION: 5.0.0
       USE_SCCACHE: "true"
       CARGO_INCREMENTAL: "0"
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -247,13 +248,14 @@ jobs:
     env:
       USE_SCCACHE: "true"
       CARGO_INCREMENTAL: "0"
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_GHA_ENABLED: "true"
       CARGO_PROFILE_DEV_DEBUG: "full"
-      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'windows') && 'packed' || 'off' }}
       CARGO_PROFILE_DEV_STRIP: "none"
       CARGO_PROFILE_RELEASE_DEBUG: "full"
-      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'windows') && 'packed' || 'off' }}
       CARGO_PROFILE_RELEASE_STRIP: "none"
       # In rust-ci, representative release-profile checks use thin LTO for faster feedback.
       CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && 'thin' || 'fat' }}
@@ -1172,6 +1174,7 @@ jobs:
     env:
       USE_SCCACHE: "true"
       CARGO_INCREMENTAL: "0"
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_GHA_ENABLED: "true"
 
