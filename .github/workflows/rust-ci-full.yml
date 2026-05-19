@@ -837,21 +837,28 @@ jobs:
             if [[ -n "$dsym_source" ]]; then
               echo "Found macOS dSYM bundle: $dsym_source"
               cp -R "$dsym_source" "$dsym_dest"
+              if [[ -d "$dsym_dest" ]] && require_macos_dsym "$dsym_dest"; then
+                compress_directory "$dsym_dest"
+                rm -rf "$dsym_dest"
+                return 0
+              fi
+              echo "Copied macOS dSYM bundle is invalid; attempting dsymutil regeneration for $source"
+              rm -rf "$dsym_dest"
             elif command -v dsymutil >/dev/null 2>&1; then
               if ! dsymutil "$source" -o "$dsym_dest"; then
                 echo "dsymutil could not create a dSYM bundle for $source"
+                rm -rf "$dsym_dest"
+              elif [[ -d "$dsym_dest" ]] && require_macos_dsym "$dsym_dest"; then
+                compress_directory "$dsym_dest"
+                rm -rf "$dsym_dest"
+                return 0
+              else
+                echo "dsymutil produced an invalid dSYM bundle for $source"
                 rm -rf "$dsym_dest"
               fi
             else
               echo "macOS dSYM bundle is missing and dsymutil is unavailable for $source"
             fi
-
-            if [[ -d "$dsym_dest" ]] && require_macos_dsym "$dsym_dest"; then
-              compress_directory "$dsym_dest"
-              rm -rf "$dsym_dest"
-              return 0
-            fi
-            rm -rf "$dsym_dest"
 
             if has_macos_debug_info "$dest" || has_macos_debug_info "$source"; then
               echo "macOS binary contains embedded DWARF debug info; no separate dSYM bundle was produced."
