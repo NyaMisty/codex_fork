@@ -410,7 +410,7 @@ jobs:
           if [[ -n "${ubsan}" ]]; then
             export LD_PRELOAD="${ubsan}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
           fi
-          exec sccache "\$@"
+          exec "\$1" "\${@:2}"
           EOF
           chmod +x "${wrapper}"
           echo "RUSTC_WRAPPER=${wrapper}" >> "$GITHUB_ENV"
