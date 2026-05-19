@@ -175,10 +175,10 @@ jobs:
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_GHA_ENABLED: "true"
       CARGO_PROFILE_DEV_DEBUG: "full"
-      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
       CARGO_PROFILE_DEV_STRIP: "none"
       CARGO_PROFILE_RELEASE_DEBUG: "full"
-      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
       CARGO_PROFILE_RELEASE_STRIP: "none"
       # In rust-ci, representative release-profile checks use thin LTO for faster feedback.
       CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && 'thin' || 'fat' }}
@@ -336,12 +336,14 @@ jobs:
           export SCCACHE_GHA_RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN}"
           export SCCACHE_GHA_CACHE_TO="${cache_prefix}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           export SCCACHE_GHA_CACHE_FROM="${SCCACHE_GHA_CACHE_TO},${cache_prefix}-,${cache_prefix},${main_cache_prefix}-,${main_cache_prefix}"
+          export SCCACHE_ERROR_LOG="${RUNNER_TEMP}/sccache-${{ matrix.target }}-${{ matrix.profile }}.log"
           {
             echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
             echo "SCCACHE_GHA_CACHE_URL=${SCCACHE_GHA_CACHE_URL}"
             echo "SCCACHE_GHA_RUNTIME_TOKEN=${SCCACHE_GHA_RUNTIME_TOKEN}"
             echo "SCCACHE_GHA_CACHE_TO=${SCCACHE_GHA_CACHE_TO}"
             echo "SCCACHE_GHA_CACHE_FROM=${SCCACHE_GHA_CACHE_FROM}"
+            echo "SCCACHE_ERROR_LOG=${SCCACHE_ERROR_LOG}"
           } >> "$GITHUB_ENV"
           echo "Using sccache GitHub Actions backend"
 
@@ -407,25 +409,21 @@ jobs:
           fi
           wrapper_root="${RUNNER_TEMP:-/tmp}"
           wrapper="${wrapper_root}/rustc-ubsan-wrapper"
+          real_rustc="$(rustup which rustc)"
           cat > "${wrapper}" <<EOF
           #!/usr/bin/env bash
           set -euo pipefail
           if [[ -n "${ubsan}" ]]; then
             export LD_PRELOAD="${ubsan}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
           fi
-          if command -v sccache >/dev/null 2>&1; then
-            exec sccache "\$@"
-          fi
-          exec "\$1" "\${@:2}"
+          exec "${real_rustc}" "\$@"
           EOF
           chmod +x "${wrapper}"
-          echo "RUSTC_WRAPPER=${wrapper}" >> "$GITHUB_ENV"
+          echo "RUSTC=${wrapper}" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
           echo "RUSTC_WORKSPACE_WRAPPER=" >> "$GITHUB_ENV"
           if command -v sccache >/dev/null 2>&1; then
             sccache --stop-server || true
-            if [[ -n "${ubsan}" ]]; then
-              export LD_PRELOAD="${ubsan}${LD_PRELOAD:+:${LD_PRELOAD}}"
-            fi
             for attempt in 1 2 3 4 5; do
               if sccache --start-server; then
                 sccache --show-stats || true
@@ -540,11 +538,31 @@ jobs:
           cargo_with_timeout() {
             # Keep a GitHub-hosted runner from being externally killed mid-build
             # before this step can fail normally and print artifact diagnostics.
-            if command -v timeout >/dev/null 2>&1 && timeout --help 2>&1 | grep -q -- '--foreground'; then
-              timeout --foreground 330m cargo "$@"
-            else
-              cargo "$@"
-            fi
+            local attempt
+            local status
+            for attempt in 1 2; do
+              if command -v timeout >/dev/null 2>&1 && timeout --help 2>&1 | grep -q -- '--foreground'; then
+                if timeout --foreground 330m cargo "$@"; then
+                  return 0
+                else
+                  status=$?
+                fi
+              else
+                if cargo "$@"; then
+                  return 0
+                else
+                  status=$?
+                fi
+              fi
+              if (( attempt == 1 )) && [[ "${USE_SCCACHE:-}" == "true" ]] && command -v sccache >/dev/null 2>&1; then
+                echo "cargo command failed with status ${status}; restarting sccache and retrying once"
+                sccache --stop-server || true
+                sccache --start-server || true
+                sccache --show-stats || true
+                continue
+              fi
+              return "$status"
+            done
           }
 
           build_args=(--bin codex)
@@ -693,30 +711,20 @@ jobs:
               return 0
             fi
 
+            if [[ "$target" == *apple-darwin* ]]; then
+              return 0
+            fi
+
             if command -v file >/dev/null 2>&1; then
-              file "$file"
-              if file "$file" | grep -qi 'stripped'; then
+              file_output="$(file "$file")"
+              echo "$file_output"
+              if grep -qi 'stripped' <<<"$file_output" && ! grep -qi 'not stripped' <<<"$file_output"; then
                 echo "artifact binary is stripped but symbols are required: $file"
                 exit 1
               fi
             fi
 
-            if [[ "$target" == *apple-darwin* ]]; then
-              if command -v dwarfdump >/dev/null 2>&1; then
-                if ! dwarfdump --debug-info "$file" 2>/dev/null | grep -q 'DW_TAG_compile_unit'; then
-                  echo "artifact binary is missing DWARF debug info: $file"
-                  exit 1
-                fi
-              elif command -v dsymutil >/dev/null 2>&1; then
-                if ! dsymutil --statistics "$file" 2>/dev/null | grep -Eq 'object files|debug map'; then
-                  echo "artifact binary is missing usable debug info: $file"
-                  exit 1
-                fi
-              else
-                echo "No tool available to verify macOS debug symbols for $file"
-                exit 1
-              fi
-            elif command -v readelf >/dev/null 2>&1; then
+            if command -v readelf >/dev/null 2>&1; then
               if ! readelf -S "$file" 2>/dev/null | grep -q '\.debug_info'; then
                 echo "artifact binary is missing .debug_info: $file"
                 exit 1
@@ -753,6 +761,58 @@ jobs:
             ) > "$artifact_dir/SHA256SUMS.txt"
           }
 
+          require_macos_dsym() {
+            local dsym_dir="$1"
+            if [[ ! -d "$dsym_dir" ]]; then
+              echo "required macOS dSYM bundle is missing: $dsym_dir"
+              exit 1
+            fi
+            require_tree_min_size "$dsym_dir" 1000000
+            local dwarf_file
+            dwarf_file="$(find "$dsym_dir/Contents/Resources/DWARF" -maxdepth 1 -type f -print -quit 2>/dev/null || true)"
+            if [[ -z "$dwarf_file" ]]; then
+              echo "macOS dSYM bundle does not contain a DWARF file: $dsym_dir"
+              exit 1
+            fi
+            if ! command -v dwarfdump >/dev/null 2>&1; then
+              echo "No tool available to verify macOS dSYM debug info for $dsym_dir"
+              exit 1
+            fi
+            if ! dwarfdump --debug-info "$dwarf_file" 2>/dev/null | grep -q 'DW_TAG_compile_unit'; then
+              echo "macOS dSYM is missing DWARF debug info: $dsym_dir"
+              exit 1
+            fi
+          }
+
+          compress_directory() {
+            local dir="$1"
+            local base
+            local parent
+            base="$(basename "$dir")"
+            parent="$(dirname "$dir")"
+            tar -C "$parent" -czf "$artifact_dir/${base}.tar.gz" "$base"
+            tar -C "$parent" -cf - "$base" | zstd -f -T0 -19 -o "$artifact_dir/${base}.tar.zst"
+          }
+
+          stage_macos_dsym() {
+            local source="$1"
+            local dest="$2"
+            local dsym_source="${source}.dSYM"
+            local dsym_dest="${dest}.dSYM"
+            rm -rf "$dsym_dest"
+            if [[ -d "$dsym_source" ]]; then
+              cp -R "$dsym_source" "$dsym_dest"
+            elif command -v dsymutil >/dev/null 2>&1; then
+              dsymutil "$source" -o "$dsym_dest"
+            else
+              echo "required macOS dSYM bundle is missing and dsymutil is unavailable: $dsym_source"
+              exit 1
+            fi
+            require_macos_dsym "$dsym_dest"
+            compress_directory "$dsym_dest"
+            rm -rf "$dsym_dest"
+          }
+
           stage_binary() {
             local binary="$1"
             local min_size="$2"
@@ -766,10 +826,23 @@ jobs:
             chmod 0755 "$dest" || true
             require_file_min_size "$dest" "$min_size"
             require_symbols "$dest"
-            if [[ "$target" == *windows* ]]; then
-              local pdb_source="${release_dir}/${binary}.pdb"
+            if [[ "$target" == *apple-darwin* ]]; then
+              stage_macos_dsym "$source" "$dest"
+            elif [[ "$target" == *windows* ]]; then
+              local pdb_source=""
+              local candidate
+              for candidate in \
+                "${release_dir}/${binary}.pdb" \
+                "${release_dir}/deps/${binary}.pdb" \
+                "${release_dir}/deps/${binary//-/_}.pdb" \
+                "${release_dir}/${binary//-/_}.pdb"; do
+                if [[ -f "$candidate" ]]; then
+                  pdb_source="$candidate"
+                  break
+                fi
+              done
               local pdb_dest="${artifact_dir}/${binary}-${target}.pdb"
-              if [[ ! -f "$pdb_source" ]]; then
+              if [[ -z "$pdb_source" ]]; then
                 echo "required Windows symbol file is missing: $pdb_source"
                 exit 1
               fi
@@ -912,7 +985,13 @@ jobs:
       - name: sccache stats
         if: always() && env.USE_SCCACHE == 'true'
         continue-on-error: true
-        run: sccache --show-stats || true
+        shell: bash
+        run: |
+          sccache --show-stats || true
+          if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+            echo "sccache error log tail:"
+            tail -200 "${SCCACHE_ERROR_LOG}" || true
+          fi
 
       - name: sccache summary
         if: always() && env.USE_SCCACHE == 'true'
@@ -924,7 +1003,23 @@ jobs:
             echo '```';
             sccache --show-stats || true;
             echo '```';
+            if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+              echo;
+              echo "#### sccache error log tail";
+              echo;
+              echo '```';
+              tail -200 "${SCCACHE_ERROR_LOG}" || true;
+              echo '```';
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare APT cache for save (musl)
+        if: always() && !cancelled() && (matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /var/cache/apt/archives/partial
+          sudo chown -R "$USER:$USER" /var/cache/apt
 
       - name: Save APT cache (musl)
         if: always() && !cancelled() && (matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl') && steps.cache_apt_restore.outputs.cache-hit != 'true'
@@ -938,7 +1033,6 @@ jobs:
   tests:
     name: Tests — ${{ matrix.runner }} - ${{ matrix.target }}${{ matrix.remote_env == 'true' && ' (remote)' || '' }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
-    continue-on-error: true
     defaults:
       run:
         working-directory: codex-rs
@@ -1051,12 +1145,14 @@ jobs:
           export SCCACHE_GHA_RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN}"
           export SCCACHE_GHA_CACHE_TO="${cache_prefix}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           export SCCACHE_GHA_CACHE_FROM="${SCCACHE_GHA_CACHE_TO},${cache_prefix}-,${cache_prefix},${main_cache_prefix}-,${main_cache_prefix}"
+          export SCCACHE_ERROR_LOG="${RUNNER_TEMP}/sccache-${{ matrix.target }}-tests.log"
           {
             echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
             echo "SCCACHE_GHA_CACHE_URL=${SCCACHE_GHA_CACHE_URL}"
             echo "SCCACHE_GHA_RUNTIME_TOKEN=${SCCACHE_GHA_RUNTIME_TOKEN}"
             echo "SCCACHE_GHA_CACHE_TO=${SCCACHE_GHA_CACHE_TO}"
             echo "SCCACHE_GHA_CACHE_FROM=${SCCACHE_GHA_CACHE_FROM}"
+            echo "SCCACHE_ERROR_LOG=${SCCACHE_ERROR_LOG}"
           } >> "$GITHUB_ENV"
           echo "Using sccache GitHub Actions backend"
 
@@ -1105,7 +1201,6 @@ jobs:
 
       - name: tests
         id: test
-        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -1153,7 +1248,13 @@ jobs:
       - name: sccache stats
         if: always() && env.USE_SCCACHE == 'true'
         continue-on-error: true
-        run: sccache --show-stats || true
+        shell: bash
+        run: |
+          sccache --show-stats || true
+          if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+            echo "sccache error log tail:"
+            tail -200 "${SCCACHE_ERROR_LOG}" || true
+          fi
 
       - name: sccache summary
         if: always() && env.USE_SCCACHE == 'true'
@@ -1165,6 +1266,14 @@ jobs:
             echo '```';
             sccache --show-stats || true;
             echo '```';
+            if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+              echo;
+              echo "#### sccache error log tail";
+              echo;
+              echo '```';
+              tail -200 "${SCCACHE_ERROR_LOG}" || true;
+              echo '```';
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Tear down remote test env
@@ -1180,9 +1289,10 @@ jobs:
           STEPS_TEST_OUTCOME: ${{ steps.test.outcome }}
 
       - name: verify tests passed
-        if: steps.test.outcome == 'failure'
+        if: ${{ failure() && steps.test.outcome == 'failure' }}
         run: |
-          echo "Tests failed. See logs for details. Ignoring per fork rust-ci-full artifact policy."
+          echo "Tests failed. See logs for details."
+          exit 1
 
   # --- Gatherer job for the full post-merge workflow --------------------------
   results:
@@ -1213,9 +1323,7 @@ jobs:
           [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }
           [[ '${{ needs.cargo_shear.result }}' == 'success' ]] || { echo 'cargo_shear failed'; exit 1; }
           [[ '${{ needs.lint_build.result }}' == 'success' ]] || { echo 'lint_build failed'; exit 1; }
-          if [[ '${{ needs.tests.result }}' != 'success' ]]; then
-            echo 'tests failed; ignoring per fork rust-ci-full artifact policy'
-          fi
+          [[ '${{ needs.tests.result }}' == 'success' ]] || { echo 'tests failed'; exit 1; }
 
       - name: sccache summary note
         if: always()
