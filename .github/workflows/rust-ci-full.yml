@@ -844,7 +844,9 @@ jobs:
               fi
               echo "Copied macOS dSYM bundle is invalid; attempting dsymutil regeneration for $source"
               rm -rf "$dsym_dest"
-            elif command -v dsymutil >/dev/null 2>&1; then
+            fi
+
+            if command -v dsymutil >/dev/null 2>&1; then
               if ! dsymutil "$source" -o "$dsym_dest"; then
                 echo "dsymutil could not create a dSYM bundle for $source"
                 rm -rf "$dsym_dest"
