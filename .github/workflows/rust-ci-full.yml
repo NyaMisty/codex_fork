@@ -313,6 +313,7 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', 'on');
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
@@ -331,6 +332,7 @@ jobs:
           cache_scope="${cache_scope//[^A-Za-z0-9_.-]/-}"
           cache_prefix="sccache-${cache_scope}-${{ matrix.target }}-${{ matrix.profile }}"
           main_cache_prefix="sccache-main-${{ matrix.target }}-${{ matrix.profile }}"
+          export ACTIONS_CACHE_SERVICE_V2=on
           export SCCACHE_GHA_ENABLED=true
           export SCCACHE_GHA_CACHE_URL="${ACTIONS_RESULTS_URL}"
           export SCCACHE_GHA_RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN}"
@@ -338,6 +340,7 @@ jobs:
           export SCCACHE_GHA_CACHE_FROM="${SCCACHE_GHA_CACHE_TO},${cache_prefix}-,${cache_prefix},${main_cache_prefix}-,${main_cache_prefix}"
           export SCCACHE_ERROR_LOG="${RUNNER_TEMP}/sccache-${{ matrix.target }}-${{ matrix.profile }}.log"
           {
+            echo "ACTIONS_CACHE_SERVICE_V2=${ACTIONS_CACHE_SERVICE_V2}"
             echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
             echo "SCCACHE_GHA_CACHE_URL=${SCCACHE_GHA_CACHE_URL}"
             echo "SCCACHE_GHA_RUNTIME_TOKEN=${SCCACHE_GHA_RUNTIME_TOKEN}"
@@ -784,6 +787,12 @@ jobs:
             fi
           }
 
+          has_macos_debug_info() {
+            local file="$1"
+            command -v dwarfdump >/dev/null 2>&1 || return 1
+            dwarfdump --debug-info "$file" 2>/dev/null | grep -q 'DW_TAG_compile_unit'
+          }
+
           compress_directory() {
             local dir="$1"
             local base
@@ -803,14 +812,24 @@ jobs:
             if [[ -d "$dsym_source" ]]; then
               cp -R "$dsym_source" "$dsym_dest"
             elif command -v dsymutil >/dev/null 2>&1; then
-              dsymutil "$source" -o "$dsym_dest"
+              dsymutil "$source" -o "$dsym_dest" || true
             else
-              echo "required macOS dSYM bundle is missing and dsymutil is unavailable: $dsym_source"
-              exit 1
+              echo "macOS dSYM bundle is missing and dsymutil is unavailable: $dsym_source"
             fi
-            require_macos_dsym "$dsym_dest"
-            compress_directory "$dsym_dest"
-            rm -rf "$dsym_dest"
+            if [[ -d "$dsym_dest" ]]; then
+              require_macos_dsym "$dsym_dest"
+              compress_directory "$dsym_dest"
+              rm -rf "$dsym_dest"
+              return 0
+            fi
+
+            if has_macos_debug_info "$dest" || has_macos_debug_info "$source"; then
+              echo "macOS binary contains embedded DWARF debug info; no separate dSYM bundle was produced."
+              return 0
+            fi
+
+            echo "required macOS debug symbols are missing: no dSYM bundle and no embedded DWARF debug info for $dest"
+            exit 1
           }
 
           stage_binary() {
@@ -1122,6 +1141,7 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', 'on');
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
@@ -1140,6 +1160,7 @@ jobs:
           cache_scope="${cache_scope//[^A-Za-z0-9_.-]/-}"
           cache_prefix="sccache-${cache_scope}-${{ matrix.target }}-${{ matrix.profile }}"
           main_cache_prefix="sccache-main-${{ matrix.target }}-${{ matrix.profile }}"
+          export ACTIONS_CACHE_SERVICE_V2=on
           export SCCACHE_GHA_ENABLED=true
           export SCCACHE_GHA_CACHE_URL="${ACTIONS_RESULTS_URL}"
           export SCCACHE_GHA_RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN}"
@@ -1147,6 +1168,7 @@ jobs:
           export SCCACHE_GHA_CACHE_FROM="${SCCACHE_GHA_CACHE_TO},${cache_prefix}-,${cache_prefix},${main_cache_prefix}-,${main_cache_prefix}"
           export SCCACHE_ERROR_LOG="${RUNNER_TEMP}/sccache-${{ matrix.target }}-tests.log"
           {
+            echo "ACTIONS_CACHE_SERVICE_V2=${ACTIONS_CACHE_SERVICE_V2}"
             echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
             echo "SCCACHE_GHA_CACHE_URL=${SCCACHE_GHA_CACHE_URL}"
             echo "SCCACHE_GHA_RUNTIME_TOKEN=${SCCACHE_GHA_RUNTIME_TOKEN}"
