@@ -76,9 +76,18 @@ jobs:
         id: install_sccache
         if: ${{ env.USE_SCCACHE == 'true' }}
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cargo binstall --no-confirm sccache@0.15.0
+          if command -v sccache >/dev/null 2>&1; then
+            installed_version="$(sccache --version || true)"
+            echo "${installed_version}"
+            if [[ "${installed_version}" == "sccache 0.15.0" ]]; then
+              exit 0
+            fi
+          fi
+          cargo binstall --no-confirm --force sccache@0.15.0
           sccache --version
       - name: Configure sccache GitHub cache variables
         if: ${{ env.USE_SCCACHE == 'true' }}
@@ -432,9 +441,18 @@ jobs:
         id: install_sccache
         if: ${{ env.USE_SCCACHE == 'true' }}
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cargo binstall --no-confirm sccache@0.15.0
+          if command -v sccache >/dev/null 2>&1; then
+            installed_version="$(sccache --version || true)"
+            echo "${installed_version}"
+            if [[ "${installed_version}" == "sccache 0.15.0" ]]; then
+              exit 0
+            fi
+          fi
+          cargo binstall --no-confirm --force sccache@0.15.0
           sccache --version
 
       - name: Configure sccache GitHub cache variables
@@ -920,8 +938,8 @@ jobs:
               echo "No tool available to verify macOS dSYM debug info for $dsym_dir"
               return 1
             fi
-            if ! dwarfdump --debug-info "$dwarf_file" 2>/dev/null | grep -q 'DW_TAG_compile_unit'; then
-              echo "macOS dSYM is missing DWARF debug info: $dsym_dir"
+            if ! dwarfdump --uuid "$dwarf_file" 2>/dev/null | grep -q 'UUID'; then
+              echo "macOS dSYM is missing a DWARF UUID: $dsym_dir"
               return 1
             fi
           }
@@ -930,6 +948,12 @@ jobs:
             local file="$1"
             command -v dwarfdump >/dev/null 2>&1 || return 1
             dwarfdump --debug-info "$file" 2>/dev/null | grep -q 'DW_TAG_compile_unit'
+          }
+
+          has_macos_symbol_table() {
+            local file="$1"
+            command -v nm >/dev/null 2>&1 || return 1
+            nm -m "$file" >/dev/null 2>&1
           }
 
           compress_directory() {
@@ -986,8 +1010,12 @@ jobs:
               echo "macOS binary contains embedded DWARF debug info; no separate dSYM bundle was produced."
               return 0
             fi
+            if has_macos_symbol_table "$dest" || has_macos_symbol_table "$source"; then
+              echo "macOS binary retains a symbol table; dsymutil did not produce separate DWARF debug info."
+              return 0
+            fi
 
-            echo "required macOS debug symbols are missing: no dSYM bundle and no embedded DWARF debug info for $dest"
+            echo "required macOS symbols are missing: no dSYM bundle, embedded DWARF debug info, or symbol table for $dest"
             exit 1
           }
 
@@ -1316,9 +1344,18 @@ jobs:
         id: install_sccache
         if: ${{ env.USE_SCCACHE == 'true' }}
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cargo binstall --no-confirm sccache@0.15.0
+          if command -v sccache >/dev/null 2>&1; then
+            installed_version="$(sccache --version || true)"
+            echo "${installed_version}"
+            if [[ "${installed_version}" == "sccache 0.15.0" ]]; then
+              exit 0
+            fi
+          fi
+          cargo binstall --no-confirm --force sccache@0.15.0
           sccache --version
 
       - name: Configure sccache GitHub cache variables

@@ -80,9 +80,18 @@ jobs:
         id: install_sccache
         if: ${{ env.USE_SCCACHE == 'true' }}
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cargo binstall --no-confirm sccache@0.15.0
+          if command -v sccache >/dev/null 2>&1; then
+            installed_version="$(sccache --version || true)"
+            echo "${installed_version}"
+            if [[ "${installed_version}" == "sccache 0.15.0" ]]; then
+              exit 0
+            fi
+          fi
+          cargo binstall --no-confirm --force sccache@0.15.0
           sccache --version
 
       - name: Configure sccache GitHub cache variables
