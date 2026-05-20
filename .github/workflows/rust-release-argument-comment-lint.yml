@@ -72,16 +72,14 @@ jobs:
 
       - name: Install cargo-binstall
         if: ${{ env.USE_SCCACHE == 'true' }}
-        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
-        with:
-          tool: cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.19.1
       - name: Install sccache
         id: install_sccache
         if: ${{ env.USE_SCCACHE == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          cargo binstall -y sccache@0.15.0
+          cargo binstall --no-confirm sccache@0.15.0
           sccache --version
 
       - name: Configure sccache GitHub cache variables
