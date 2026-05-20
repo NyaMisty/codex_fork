@@ -26,16 +26,24 @@ on:
 jobs:
   build-windows-binaries:
     name: Build Windows binaries - ${{ matrix.runner }} - ${{ matrix.target }} - ${{ matrix.bundle }}
-    runs-on: ${{ matrix.runs_on }}
+    runs-on: ${{ matrix.runs_on || matrix.runner }}
     # Windows release builds can exceed an hour on fat-LTO mainline releases,
     # so keep the timeout aligned with the top-level release build headroom.
-    timeout-minutes: 90
+    timeout-minutes: 360
     permissions:
       contents: read
     defaults:
       run:
         working-directory: codex-rs
     env:
+      USE_SCCACHE: "true"
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_PROFILE_RELEASE_DEBUG: "full"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "packed"
+      CARGO_PROFILE_RELEASE_STRIP: "none"
       CARGO_PROFILE_RELEASE_LTO: ${{ inputs.release-lto }}
 
     strategy:
@@ -46,44 +54,32 @@ jobs:
             target: x86_64-pc-windows-msvc
             bundle: primary
             binaries: "codex codex-responses-api-proxy"
-            runs_on:
-              - self-hosted
-              - codex-windows-x64
+            runs_on: windows-latest
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             bundle: primary
             binaries: "codex codex-responses-api-proxy"
-            runs_on:
-              - self-hosted
-              - codex-windows-arm64
+            runs_on: windows-11-arm
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             bundle: helpers
             binaries: "codex-windows-sandbox-setup codex-command-runner"
-            runs_on:
-              - self-hosted
-              - codex-windows-x64
+            runs_on: windows-latest
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             bundle: helpers
             binaries: "codex-windows-sandbox-setup codex-command-runner"
-            runs_on:
-              - self-hosted
-              - codex-windows-arm64
+            runs_on: windows-11-arm
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             bundle: app-server
             binaries: "codex-app-server"
-            runs_on:
-              - self-hosted
-              - codex-windows-x64
+            runs_on: windows-latest
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             bundle: app-server
             binaries: "codex-app-server"
-            runs_on:
-              - self-hosted
-              - codex-windows-arm64
+            runs_on: windows-11-arm
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -107,6 +103,73 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install sccache
+        id: install_sccache
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache@0.15.0
+
+      - name: Configure sccache GitHub cache variables
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', 'on');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure sccache backend
+        id: configure_sccache_backend
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${ACTIONS_RESULTS_URL:-}" || -z "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
+            echo "GitHub Actions cache variables are required for sccache GHA backend."
+            echo "ACTIONS_RESULTS_URL=${ACTIONS_RESULTS_URL:+set}"
+            echo "ACTIONS_RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN:+set}"
+            exit 1
+          fi
+          cache_scope="${GITHUB_REF_NAME:-main}"
+          cache_scope="${cache_scope//[^A-Za-z0-9_.-]/-}"
+          cache_prefix="sccache-${cache_scope}-release-windows-${{ matrix.target }}-${{ matrix.bundle }}"
+          main_cache_prefix="sccache-main-release-windows-${{ matrix.target }}-${{ matrix.bundle }}"
+          export ACTIONS_CACHE_SERVICE_V2=on
+          export SCCACHE_GHA_ENABLED=true
+          export SCCACHE_GHA_CACHE_URL="${ACTIONS_RESULTS_URL}"
+          export SCCACHE_GHA_RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN}"
+          export SCCACHE_GHA_CACHE_TO="${cache_prefix}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export SCCACHE_GHA_CACHE_FROM="${SCCACHE_GHA_CACHE_TO},${cache_prefix}-,${cache_prefix},${main_cache_prefix}-,${main_cache_prefix}"
+          export SCCACHE_ERROR_LOG="${RUNNER_TEMP}/sccache-release-windows-${{ matrix.target }}-${{ matrix.bundle }}.log"
+          {
+            echo "ACTIONS_CACHE_SERVICE_V2=${ACTIONS_CACHE_SERVICE_V2}"
+            echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+            echo "SCCACHE_GHA_CACHE_URL=${SCCACHE_GHA_CACHE_URL}"
+            echo "SCCACHE_GHA_RUNTIME_TOKEN=${SCCACHE_GHA_RUNTIME_TOKEN}"
+            echo "SCCACHE_GHA_CACHE_TO=${SCCACHE_GHA_CACHE_TO}"
+            echo "SCCACHE_GHA_CACHE_FROM=${SCCACHE_GHA_CACHE_FROM}"
+            echo "SCCACHE_ERROR_LOG=${SCCACHE_ERROR_LOG}"
+          } >> "$GITHUB_ENV"
+          echo "Using sccache GitHub Actions backend"
+
+          for attempt in 1 2 3 4 5; do
+            if sccache --start-server; then
+              sccache --show-stats || true
+              exit 0
+            fi
+            sleep_seconds=$((attempt * 15))
+            echo "sccache GHA backend startup failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+            sleep "$sleep_seconds"
+          done
+          echo "sccache GHA backend failed to start after retries"
+          exit 1
+
+      - name: Enable sccache wrapper
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
       - name: Cargo build (Windows binaries)
         shell: bash
         run: |
@@ -123,13 +186,70 @@ jobs:
           path: codex-rs/target/**/cargo-timings/cargo-timing.html
           if-no-files-found: warn
 
+      - name: sccache stats
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          sccache --show-stats || true
+          if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+            echo "sccache error log tail:"
+            tail -200 "${SCCACHE_ERROR_LOG}" || true
+          fi
+
+      - name: sccache summary
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
+        shell: bash
+        run: |
+          {
+            echo "### sccache stats - release windows ${{ matrix.target }} (${{ matrix.bundle }})";
+            echo;
+            echo '```';
+            sccache --show-stats || true;
+            echo '```';
+            if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+              echo;
+              echo "#### sccache error log tail";
+              echo;
+              echo '```';
+              tail -200 "${SCCACHE_ERROR_LOG}" || true;
+              echo '```';
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Stage Windows binaries
         shell: bash
         run: |
+          set -euo pipefail
           output_dir="target/${{ matrix.target }}/release/staged-${{ matrix.bundle }}"
           mkdir -p "$output_dir"
+
+          stage_pdb() {
+            local binary="$1"
+            local candidate
+            local pdb_source=""
+            for candidate in \
+              "target/${{ matrix.target }}/release/${binary}.pdb" \
+              "target/${{ matrix.target }}/release/deps/${binary}.pdb" \
+              "target/${{ matrix.target }}/release/deps/${binary//-/_}.pdb" \
+              "target/${{ matrix.target }}/release/${binary//-/_}.pdb"; do
+              if [[ -f "$candidate" ]]; then
+                pdb_source="$candidate"
+                break
+              fi
+            done
+
+            if [[ -z "$pdb_source" ]]; then
+              echo "required symbol file missing for ${binary}"
+              exit 1
+            fi
+
+            cp "$pdb_source" "$output_dir/${binary}.pdb"
+          }
+
           for binary in ${{ matrix.binaries }}; do
             cp "target/${{ matrix.target }}/release/${binary}.exe" "$output_dir/${binary}.exe"
+            stage_pdb "$binary"
           done
 
       - name: Upload Windows binaries
@@ -144,7 +264,7 @@ jobs:
       - build-windows-binaries
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
     runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 90
+    timeout-minutes: 360
     permissions:
       contents: read
       id-token: write
@@ -161,14 +281,10 @@ jobs:
         include:
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
-            runs_on:
-              - self-hosted
-              - codex-windows-x64
+            runs_on: windows-latest
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
-            runs_on:
-              - self-hosted
-              - codex-windows-arm64
+            runs_on: windows-11-arm
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -199,6 +315,24 @@ jobs:
           set -euo pipefail
           for binary in ${WINDOWS_BINARIES}; do
             ls -lh "target/${{ matrix.target }}/release/${binary}.exe"
+            pdb_candidates=(
+              "target/${{ matrix.target }}/release/${binary}.pdb"
+              "target/${{ matrix.target }}/release/deps/${binary}.pdb"
+              "target/${{ matrix.target }}/release/deps/${binary//-/_}.pdb"
+              "target/${{ matrix.target }}/release/${binary//-/_}.pdb"
+            )
+            found_pdb=""
+            for candidate in "${pdb_candidates[@]}"; do
+              if [[ -f "$candidate" ]]; then
+                found_pdb="$candidate"
+                break
+              fi
+            done
+            if [[ -z "$found_pdb" ]]; then
+              echo "missing PDB for ${binary}"
+              exit 1
+            fi
+            ls -lh "$found_pdb"
           done
 
       - name: Sign Windows binaries with Azure Trusted Signing
@@ -217,12 +351,37 @@ jobs:
       - name: Stage artifacts
         shell: bash
         run: |
+          set -euo pipefail
           dest="dist/${{ matrix.target }}"
           mkdir -p "$dest"
+
+          stage_pdb() {
+            local binary="$1"
+            local candidate
+            local pdb_source=""
+            for candidate in \
+              "target/${{ matrix.target }}/release/${binary}.pdb" \
+              "target/${{ matrix.target }}/release/deps/${binary}.pdb" \
+              "target/${{ matrix.target }}/release/deps/${binary//-/_}.pdb" \
+              "target/${{ matrix.target }}/release/${binary//-/_}.pdb"; do
+              if [[ -f "$candidate" ]]; then
+                pdb_source="$candidate"
+                break
+              fi
+            done
+
+            if [[ -z "$pdb_source" ]]; then
+              echo "required symbol file missing for ${binary}"
+              exit 1
+            fi
+
+            cp "$pdb_source" "$dest/${binary}-${{ matrix.target }}.pdb"
+          }
 
           for binary in ${WINDOWS_BINARIES}; do
             cp "target/${{ matrix.target }}/release/${binary}.exe" \
               "$dest/${binary}-${{ matrix.target }}.exe"
+            stage_pdb "$binary"
           done
 
       - name: Build Python runtime wheel

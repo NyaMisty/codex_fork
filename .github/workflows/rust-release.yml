@@ -144,7 +144,7 @@ jobs:
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     # Release builds can take a long time, so leave some headroom to avoid
     # having to restart the full workflow due to a timeout.
-    timeout-minutes: 90
+    timeout-minutes: 360
     permissions:
       contents: read
       id-token: write
@@ -152,6 +152,14 @@ jobs:
       run:
         working-directory: codex-rs
     env:
+      USE_SCCACHE: "true"
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_PROFILE_RELEASE_DEBUG: "full"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_RELEASE_STRIP: "none"
       # 2026-03-04: temporarily change releases to use thin LTO because
       # Ubuntu ARM is timing out at 60 minutes.
       CARGO_PROFILE_RELEASE_LTO: ${{ contains(github.ref_name, '-alpha') && 'thin' || 'thin' }}
@@ -167,28 +175,28 @@ jobs:
             artifact_name: aarch64-apple-darwin
             binaries: "codex codex-responses-api-proxy"
             build_dmg: "true"
-            runs_on: ""
+            runs_on: macos-15
           - runner: macos-15-xlarge
             target: aarch64-apple-darwin
             bundle: app-server
             artifact_name: aarch64-apple-darwin-app-server
             binaries: "codex-app-server"
             build_dmg: "false"
-            runs_on: ""
+            runs_on: macos-15
           - runner: macos-15-xlarge
             target: x86_64-apple-darwin
             bundle: primary
             artifact_name: x86_64-apple-darwin
             binaries: "codex codex-responses-api-proxy"
             build_dmg: "true"
-            runs_on: ""
+            runs_on: macos-15
           - runner: macos-15-xlarge
             target: x86_64-apple-darwin
             bundle: app-server
             artifact_name: x86_64-apple-darwin-app-server
             binaries: "codex-app-server"
             build_dmg: "false"
-            runs_on: ""
+            runs_on: macos-15
           # Release artifacts intentionally ship MUSL-linked Linux binaries.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
@@ -267,16 +275,54 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+          apt_retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if sudo DEBIAN_FRONTEND=noninteractive apt-get \
+                -o Acquire::Retries=5 \
+                -o Acquire::ForceIPv4=true \
+                "$@"; then
+                return 0
+              fi
+              sleep_seconds=$((attempt * 20))
+              echo "apt-get $* failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+              sudo apt-get clean || true
+              sleep "$sleep_seconds"
+            done
+            sudo DEBIAN_FRONTEND=noninteractive apt-get \
+              -o Acquire::Retries=5 \
+              -o Acquire::ForceIPv4=true \
+              "$@"
+          }
+          apt_retry update -y
+          apt_retry install -y --no-install-recommends pkg-config libcap-dev
       - name: Install UBSan runtime (musl)
         if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' }}
         shell: bash
         run: |
           set -euo pipefail
           if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libubsan1
+            apt_retry() {
+              local attempt
+              for attempt in 1 2 3 4 5; do
+                if sudo DEBIAN_FRONTEND=noninteractive apt-get \
+                  -o Acquire::Retries=5 \
+                  -o Acquire::ForceIPv4=true \
+                  "$@"; then
+                  return 0
+                fi
+                sleep_seconds=$((attempt * 20))
+                echo "apt-get $* failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+                sudo apt-get clean || true
+                sleep "$sleep_seconds"
+              done
+              sudo DEBIAN_FRONTEND=noninteractive apt-get \
+                -o Acquire::Retries=5 \
+                -o Acquire::ForceIPv4=true \
+                "$@"
+            }
+            apt_retry update -y
+            apt_retry install -y libubsan1
           fi
       - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
@@ -293,6 +339,73 @@ jobs:
           echo "${cargo_home}/bin" >> "$GITHUB_PATH"
           : > "${cargo_home}/config.toml"
 
+      - name: Install sccache
+        id: install_sccache
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache@0.15.0
+
+      - name: Configure sccache GitHub cache variables
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', 'on');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure sccache backend
+        id: configure_sccache_backend
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${ACTIONS_RESULTS_URL:-}" || -z "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
+            echo "GitHub Actions cache variables are required for sccache GHA backend."
+            echo "ACTIONS_RESULTS_URL=${ACTIONS_RESULTS_URL:+set}"
+            echo "ACTIONS_RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN:+set}"
+            exit 1
+          fi
+          cache_scope="${GITHUB_REF_NAME:-main}"
+          cache_scope="${cache_scope//[^A-Za-z0-9_.-]/-}"
+          cache_prefix="sccache-${cache_scope}-release-${{ matrix.target }}-${{ matrix.bundle }}"
+          main_cache_prefix="sccache-main-release-${{ matrix.target }}-${{ matrix.bundle }}"
+          export ACTIONS_CACHE_SERVICE_V2=on
+          export SCCACHE_GHA_ENABLED=true
+          export SCCACHE_GHA_CACHE_URL="${ACTIONS_RESULTS_URL}"
+          export SCCACHE_GHA_RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN}"
+          export SCCACHE_GHA_CACHE_TO="${cache_prefix}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export SCCACHE_GHA_CACHE_FROM="${SCCACHE_GHA_CACHE_TO},${cache_prefix}-,${cache_prefix},${main_cache_prefix}-,${main_cache_prefix}"
+          export SCCACHE_ERROR_LOG="${RUNNER_TEMP}/sccache-release-${{ matrix.target }}-${{ matrix.bundle }}.log"
+          {
+            echo "ACTIONS_CACHE_SERVICE_V2=${ACTIONS_CACHE_SERVICE_V2}"
+            echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+            echo "SCCACHE_GHA_CACHE_URL=${SCCACHE_GHA_CACHE_URL}"
+            echo "SCCACHE_GHA_RUNTIME_TOKEN=${SCCACHE_GHA_RUNTIME_TOKEN}"
+            echo "SCCACHE_GHA_CACHE_TO=${SCCACHE_GHA_CACHE_TO}"
+            echo "SCCACHE_GHA_CACHE_FROM=${SCCACHE_GHA_CACHE_FROM}"
+            echo "SCCACHE_ERROR_LOG=${SCCACHE_ERROR_LOG}"
+          } >> "$GITHUB_ENV"
+          echo "Using sccache GitHub Actions backend"
+
+          for attempt in 1 2 3 4 5; do
+            if sccache --start-server; then
+              sccache --show-stats || true
+              exit 0
+            fi
+            sleep_seconds=$((attempt * 15))
+            echo "sccache GHA backend startup failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+            sleep "$sleep_seconds"
+          done
+          echo "sccache GHA backend failed to start after retries"
+          exit 1
+
+      - name: Enable sccache wrapper
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -304,6 +417,8 @@ jobs:
         name: Install musl build tools
         env:
           TARGET: ${{ matrix.target }}
+          APT_UPDATE_ARGS: -o Acquire::Retries=5 -o Acquire::ForceIPv4=true
+          APT_INSTALL_ARGS: --no-install-recommends
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
 
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
@@ -323,11 +438,31 @@ jobs:
           if [[ -n "${ubsan}" ]]; then
             export LD_PRELOAD="${ubsan}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
           fi
+          if command -v sccache >/dev/null 2>&1; then
+            exec sccache "\$@"
+          fi
           exec "\$1" "\${@:2}"
           EOF
           chmod +x "${wrapper}"
           echo "RUSTC_WRAPPER=${wrapper}" >> "$GITHUB_ENV"
           echo "RUSTC_WORKSPACE_WRAPPER=" >> "$GITHUB_ENV"
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --stop-server || true
+            if [[ -n "${ubsan}" ]]; then
+              export LD_PRELOAD="${ubsan}${LD_PRELOAD:+:${LD_PRELOAD}}"
+            fi
+            for attempt in 1 2 3 4 5; do
+              if sccache --start-server; then
+                sccache --show-stats || true
+                exit 0
+              fi
+              sleep_seconds=$((attempt * 15))
+              echo "sccache GHA backend restart failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+              sleep "$sleep_seconds"
+            done
+            echo "sccache GHA backend failed to restart after UBSan wrapper setup"
+            exit 1
+          fi
 
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Clear sanitizer flags (musl)
@@ -361,8 +496,18 @@ jobs:
 
           cflags="$(sanitize_flags "${CFLAGS-}")"
           cxxflags="$(sanitize_flags "${CXXFLAGS-}")"
+          cflags="${cflags:+${cflags} }-fno-sanitize=undefined"
+          cxxflags="${cxxflags:+${cxxflags} }-fno-sanitize=undefined"
+          target_cflags_var="CFLAGS_${{ matrix.target }}"
+          target_cflags_var="${target_cflags_var//-/_}"
+          target_cxxflags_var="CXXFLAGS_${{ matrix.target }}"
+          target_cxxflags_var="${target_cxxflags_var//-/_}"
           echo "CFLAGS=${cflags}" >> "$GITHUB_ENV"
           echo "CXXFLAGS=${cxxflags}" >> "$GITHUB_ENV"
+          echo "${target_cflags_var}=${cflags}" >> "$GITHUB_ENV"
+          echo "${target_cxxflags_var}=${cxxflags}" >> "$GITHUB_ENV"
+          echo "CMAKE_C_FLAGS=${cflags}" >> "$GITHUB_ENV"
+          echo "CMAKE_CXX_FLAGS=${cxxflags}" >> "$GITHUB_ENV"
 
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' }}
         name: Configure musl rusty_v8 artifact overrides and verify checksums
@@ -396,6 +541,8 @@ jobs:
             build_args+=(--bin "$binary")
           done
           echo "CARGO_PROFILE_RELEASE_LTO: ${CARGO_PROFILE_RELEASE_LTO}"
+          echo "CARGO_PROFILE_RELEASE_DEBUG: ${CARGO_PROFILE_RELEASE_DEBUG}"
+          echo "CARGO_PROFILE_RELEASE_STRIP: ${CARGO_PROFILE_RELEASE_STRIP}"
           cargo build --target ${{ matrix.target }} --release --timings "${build_args[@]}"
 
       - name: Upload Cargo timings
@@ -648,11 +795,42 @@ jobs:
           path: |
             codex-rs/dist/${{ matrix.target }}/*
 
+      - name: sccache stats
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          sccache --show-stats || true
+          if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+            echo "sccache error log tail:"
+            tail -200 "${SCCACHE_ERROR_LOG}" || true
+          fi
+
+      - name: sccache summary
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
+        shell: bash
+        run: |
+          {
+            echo "### sccache stats - release ${{ matrix.target }} (${{ matrix.bundle }})";
+            echo;
+            echo '```';
+            sccache --show-stats || true;
+            echo '```';
+            if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+              echo;
+              echo "#### sccache error log tail";
+              echo;
+              echo '```';
+              tail -200 "${SCCACHE_ERROR_LOG}" || true;
+              echo '```';
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   stage-signed-macos:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode == 'promote_signed' }}
     needs: tag-check
     name: Stage signed macOS handoff - ${{ matrix.target }} - ${{ matrix.bundle }}
-    runs-on: macos-15-xlarge
+    runs-on: macos-15
     timeout-minutes: 30
     permissions:
       contents: read
@@ -878,7 +1056,9 @@ jobs:
     needs: tag-check
     uses: ./.github/workflows/rust-release-windows.yml
     with:
-      release-lto: ${{ contains(github.ref_name, '-alpha') && 'thin' || 'fat' }}
+      # Hosted Windows runners OOM with release LTO plus full debug symbols.
+      # This still builds the release profile and keeps symbols unstripped.
+      release-lto: "off"
       sign-windows: ${{ github.event_name != 'workflow_dispatch' }}
     secrets: inherit
 

@@ -18,10 +18,15 @@ jobs:
     if: ${{ inputs.publish }}
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 360
     env:
       CARGO_DYLINT_VERSION: 5.0.0
       DYLINT_LINK_VERSION: 5.0.0
+      USE_SCCACHE: "true"
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_GHA_ENABLED: "true"
 
     strategy:
       fail-fast: false
@@ -33,6 +38,7 @@ jobs:
             lib_name: libargument_comment_lint@nightly-2025-09-18-aarch64-apple-darwin.dylib
             runner_binary: argument-comment-lint
             cargo_dylint_binary: cargo-dylint
+            runs_on: macos-15
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive_name: argument-comment-lint-x86_64-unknown-linux-gnu.tar.gz
@@ -51,9 +57,7 @@ jobs:
             lib_name: argument_comment_lint@nightly-2025-09-18-x86_64-pc-windows-msvc.dll
             runner_binary: argument-comment-lint.exe
             cargo_dylint_binary: cargo-dylint.exe
-            runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+            runs_on: windows-latest
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -65,6 +69,73 @@ jobs:
           toolchain: nightly-2025-09-18
           targets: ${{ matrix.target }}
           components: llvm-tools-preview, rustc-dev, rust-src
+
+      - name: Install sccache
+        id: install_sccache
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache@0.15.0
+
+      - name: Configure sccache GitHub cache variables
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', 'on');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure sccache backend
+        id: configure_sccache_backend
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${ACTIONS_RESULTS_URL:-}" || -z "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
+            echo "GitHub Actions cache variables are required for sccache GHA backend."
+            echo "ACTIONS_RESULTS_URL=${ACTIONS_RESULTS_URL:+set}"
+            echo "ACTIONS_RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN:+set}"
+            exit 1
+          fi
+          cache_scope="${GITHUB_REF_NAME:-main}"
+          cache_scope="${cache_scope//[^A-Za-z0-9_.-]/-}"
+          cache_prefix="sccache-${cache_scope}-release-argument-comment-lint-${{ matrix.target }}"
+          main_cache_prefix="sccache-main-release-argument-comment-lint-${{ matrix.target }}"
+          export ACTIONS_CACHE_SERVICE_V2=on
+          export SCCACHE_GHA_ENABLED=true
+          export SCCACHE_GHA_CACHE_URL="${ACTIONS_RESULTS_URL}"
+          export SCCACHE_GHA_RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN}"
+          export SCCACHE_GHA_CACHE_TO="${cache_prefix}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export SCCACHE_GHA_CACHE_FROM="${SCCACHE_GHA_CACHE_TO},${cache_prefix}-,${cache_prefix},${main_cache_prefix}-,${main_cache_prefix}"
+          export SCCACHE_ERROR_LOG="${RUNNER_TEMP}/sccache-release-argument-comment-lint-${{ matrix.target }}.log"
+          {
+            echo "ACTIONS_CACHE_SERVICE_V2=${ACTIONS_CACHE_SERVICE_V2}"
+            echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+            echo "SCCACHE_GHA_CACHE_URL=${SCCACHE_GHA_CACHE_URL}"
+            echo "SCCACHE_GHA_RUNTIME_TOKEN=${SCCACHE_GHA_RUNTIME_TOKEN}"
+            echo "SCCACHE_GHA_CACHE_TO=${SCCACHE_GHA_CACHE_TO}"
+            echo "SCCACHE_GHA_CACHE_FROM=${SCCACHE_GHA_CACHE_FROM}"
+            echo "SCCACHE_ERROR_LOG=${SCCACHE_ERROR_LOG}"
+          } >> "$GITHUB_ENV"
+          echo "Using sccache GitHub Actions backend"
+
+          for attempt in 1 2 3 4 5; do
+            if sccache --start-server; then
+              sccache --show-stats || true
+              exit 0
+            fi
+            sleep_seconds=$((attempt * 15))
+            echo "sccache GHA backend startup failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+            sleep "$sleep_seconds"
+          done
+          echo "sccache GHA backend failed to start after retries"
+          exit 1
+
+      - name: Enable sccache wrapper
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Install tooling
         shell: bash
@@ -106,3 +177,34 @@ jobs:
         with:
           name: argument-comment-lint-${{ matrix.target }}
           path: dist/argument-comment-lint/${{ matrix.target }}/*
+
+      - name: sccache stats
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          sccache --show-stats || true
+          if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+            echo "sccache error log tail:"
+            tail -200 "${SCCACHE_ERROR_LOG}" || true
+          fi
+
+      - name: sccache summary
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
+        shell: bash
+        run: |
+          {
+            echo "### sccache stats - release argument-comment-lint ${{ matrix.target }}";
+            echo;
+            echo '```';
+            sccache --show-stats || true;
+            echo '```';
+            if [[ -n "${SCCACHE_ERROR_LOG:-}" && -f "${SCCACHE_ERROR_LOG}" ]]; then
+              echo;
+              echo "#### sccache error log tail";
+              echo;
+              echo '```';
+              tail -200 "${SCCACHE_ERROR_LOG}" || true;
+              echo '```';
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

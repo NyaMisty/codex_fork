@@ -67,6 +67,7 @@ jobs:
           toolchain: nightly-2025-09-18
           components: llvm-tools-preview, rustc-dev, rust-src
       - name: Install sccache
+        id: install_sccache
         if: ${{ env.USE_SCCACHE == 'true' }}
         uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
@@ -80,6 +81,7 @@ jobs:
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
       - name: Configure sccache backend
+        id: configure_sccache_backend
         if: ${{ env.USE_SCCACHE == 'true' }}
         shell: bash
         run: |
@@ -154,7 +156,7 @@ jobs:
         env:
           RUST_MIN_STACK: "8388608" # 8 MiB
       - name: sccache stats
-        if: always() && env.USE_SCCACHE == 'true'
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
@@ -251,14 +253,16 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_GHA_ENABLED: "true"
-      CARGO_PROFILE_DEV_DEBUG: ${{ contains(matrix.target, 'apple-darwin') && 'limited' || 'full' }}
+      CARGO_PROFILE_DEV_DEBUG: "full"
       CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'windows') && 'packed' || 'off' }}
       CARGO_PROFILE_DEV_STRIP: "none"
-      CARGO_PROFILE_RELEASE_DEBUG: ${{ contains(matrix.target, 'apple-darwin') && 'limited' || 'full' }}
+      CARGO_PROFILE_RELEASE_DEBUG: "full"
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'windows') && 'packed' || 'off' }}
       CARGO_PROFILE_RELEASE_STRIP: "none"
       # In rust-ci, representative release-profile checks use thin LTO for faster feedback.
-      CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && 'thin' || 'fat' }}
+      # Windows hosted runners have hit rustc/LLVM OOM with LTO while still using
+      # the release profile and full symbols, so avoid LTO only for that case.
+      CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && contains(matrix.target, 'windows') && 'off' || matrix.profile == 'release' && 'thin' || 'fat' }}
 
     strategy:
       fail-fast: false
@@ -293,17 +297,32 @@ jobs:
             profile: dev
             runs_on: windows-11-arm
 
-          # Also run representative release builds on Mac and Linux because
-          # there could be release-only build errors we want to catch.
-          # Hopefully this also pre-populates the build cache to speed up
-          # releases.
+          # Also produce release-profile artifacts for every target covered by
+          # the dev artifact matrix, so full CI validates both output profiles.
           - runner: macos-15-xlarge
             runs_on: macos-15
             target: aarch64-apple-darwin
             profile: release
             artifact: true
+          - runner: macos-15-xlarge
+            runs_on: macos-15
+            target: x86_64-apple-darwin
+            profile: release
+            artifact: true
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+            profile: release
+            artifact: true
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            profile: release
+            artifact: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            profile: release
+            artifact: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
             profile: release
             artifact: true
           - runner: windows-x64
@@ -327,12 +346,31 @@ jobs:
         run: |
           set -euo pipefail
           if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update -y
+            apt_retry() {
+              local attempt
+              for attempt in 1 2 3 4 5; do
+                if sudo DEBIAN_FRONTEND=noninteractive apt-get \
+                  -o Acquire::Retries=5 \
+                  -o Acquire::ForceIPv4=true \
+                  "$@"; then
+                  return 0
+                fi
+                sleep_seconds=$((attempt * 20))
+                echo "apt-get $* failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+                sudo apt-get clean || true
+                sleep "$sleep_seconds"
+              done
+              sudo DEBIAN_FRONTEND=noninteractive apt-get \
+                -o Acquire::Retries=5 \
+                -o Acquire::ForceIPv4=true \
+                "$@"
+            }
+            apt_retry update -y
             packages=(pkg-config libcap-dev zstd)
             if [[ "${{ matrix.target }}" == 'x86_64-unknown-linux-musl' || "${{ matrix.target }}" == 'aarch64-unknown-linux-musl' ]]; then
               packages+=(libubsan1)
             fi
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+            apt_retry install -y --no-install-recommends "${packages[@]}"
           fi
       - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
@@ -380,6 +418,7 @@ jobs:
 
       # Install sccache and use its GitHub Actions backend directly.
       - name: Install sccache
+        id: install_sccache
         if: ${{ env.USE_SCCACHE == 'true' }}
         uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
@@ -395,6 +434,7 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Configure sccache backend
+        id: configure_sccache_backend
         if: ${{ env.USE_SCCACHE == 'true' }}
         shell: bash
         run: |
@@ -473,7 +513,7 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
           TARGET: ${{ matrix.target }}
-          APT_UPDATE_ARGS: -o Acquire::Retries=3
+          APT_UPDATE_ARGS: -o Acquire::Retries=5 -o Acquire::ForceIPv4=true
           APT_INSTALL_ARGS: --no-install-recommends
         shell: bash
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
@@ -629,24 +669,14 @@ jobs:
               ;;
           esac
 
-          cargo_with_timeout() {
-            # Keep a GitHub-hosted runner from being externally killed mid-build
-            # before this step can fail normally and print artifact diagnostics.
+          cargo_with_retry() {
             local attempt
             local status
             for attempt in 1 2; do
-              if command -v timeout >/dev/null 2>&1 && timeout --help 2>&1 | grep -q -- '--foreground'; then
-                if timeout --foreground 330m cargo "$@"; then
-                  return 0
-                else
-                  status=$?
-                fi
+              if cargo "$@"; then
+                return 0
               else
-                if cargo "$@"; then
-                  return 0
-                else
-                  status=$?
-                fi
+                status=$?
               fi
               if (( attempt == 1 )) && [[ "${USE_SCCACHE:-}" == "true" ]] && command -v sccache >/dev/null 2>&1; then
                 echo "cargo command failed with status ${status}; restarting sccache and retrying once"
@@ -667,7 +697,7 @@ jobs:
           fi
 
           if [[ "$target" == *linux* ]]; then
-            cargo_with_timeout build --target "$target" "${profile_args[@]}" --locked --timings --bin bwrap
+            cargo_with_retry build --target "$target" "${profile_args[@]}" --locked --timings --bin bwrap
             bwrap_path="${release_target_dir}/${target}/${profile_dir}/bwrap"
             if [[ ! -f "$bwrap_path" ]]; then
               echo "bwrap binary ${bwrap_path} not found"
@@ -682,7 +712,7 @@ jobs:
             built_bins+=(codex-command-runner codex-windows-sandbox-setup)
           fi
 
-          cargo_with_timeout build --target "$target" "${profile_args[@]}" --locked --timings "${build_args[@]}"
+          cargo_with_retry build --target "$target" "${profile_args[@]}" --locked --timings "${build_args[@]}"
 
           echo "Built ${profile} binary sizes:"
           for binary in "${built_bins[@]}"; do
@@ -1102,7 +1132,7 @@ jobs:
       # Save caches explicitly; make non-fatal so cache packaging
       # never fails the overall job. Only save when key wasn't hit.
       - name: Save cargo home cache
-        if: always() && !cancelled() && steps.cache_cargo_home_restore.outputs.cache-hit != 'true'
+        if: always() && !cancelled() && steps.cache_cargo_home_restore.outputs.cache-hit != 'true' && steps.lockhash.outputs.hash != '' && steps.lockhash.outputs.toolchain_hash != ''
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
@@ -1118,7 +1148,7 @@ jobs:
           key: cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-${{ steps.lockhash.outputs.hash }}-${{ steps.lockhash.outputs.toolchain_hash }}
 
       - name: sccache stats
-        if: always() && env.USE_SCCACHE == 'true'
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
@@ -1129,7 +1159,7 @@ jobs:
           fi
 
       - name: sccache summary
-        if: always() && env.USE_SCCACHE == 'true'
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
         shell: bash
         run: |
           {
@@ -1212,8 +1242,27 @@ jobs:
         run: |
           set -euo pipefail
           if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev bubblewrap
+            apt_retry() {
+              local attempt
+              for attempt in 1 2 3 4 5; do
+                if sudo DEBIAN_FRONTEND=noninteractive apt-get \
+                  -o Acquire::Retries=5 \
+                  -o Acquire::ForceIPv4=true \
+                  "$@"; then
+                  return 0
+                fi
+                sleep_seconds=$((attempt * 20))
+                echo "apt-get $* failed on attempt ${attempt}; retrying in ${sleep_seconds}s"
+                sudo apt-get clean || true
+                sleep "$sleep_seconds"
+              done
+              sudo DEBIAN_FRONTEND=noninteractive apt-get \
+                -o Acquire::Retries=5 \
+                -o Acquire::ForceIPv4=true \
+                "$@"
+            }
+            apt_retry update -y
+            apt_retry install -y --no-install-recommends pkg-config libcap-dev bubblewrap
           fi
 
       # Some integration tests rely on DotSlash being installed.
@@ -1248,6 +1297,7 @@ jobs:
             cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-
 
       - name: Install sccache
+        id: install_sccache
         if: ${{ env.USE_SCCACHE == 'true' }}
         uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
@@ -1263,6 +1313,7 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Configure sccache backend
+        id: configure_sccache_backend
         if: ${{ env.USE_SCCACHE == 'true' }}
         shell: bash
         run: |
@@ -1373,7 +1424,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Save cargo home cache
-        if: always() && !cancelled() && steps.cache_cargo_home_restore.outputs.cache-hit != 'true'
+        if: always() && !cancelled() && steps.cache_cargo_home_restore.outputs.cache-hit != 'true' && steps.lockhash.outputs.hash != '' && steps.lockhash.outputs.toolchain_hash != ''
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
@@ -1385,7 +1436,7 @@ jobs:
           key: cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-${{ steps.lockhash.outputs.hash }}-${{ steps.lockhash.outputs.toolchain_hash }}
 
       - name: sccache stats
-        if: always() && env.USE_SCCACHE == 'true'
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
@@ -1396,7 +1447,7 @@ jobs:
           fi
 
       - name: sccache summary
-        if: always() && env.USE_SCCACHE == 'true'
+        if: always() && env.USE_SCCACHE == 'true' && steps.configure_sccache_backend.outcome == 'success'
         shell: bash
         run: |
           {
