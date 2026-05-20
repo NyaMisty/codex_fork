@@ -62,10 +62,13 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
-        with:
-          toolchain: nightly-2025-09-18
-          components: llvm-tools-preview, rustc-dev, rust-src
+      - name: Install argument-comment-lint Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install nightly-2025-09-18 \
+            --component llvm-tools-preview \
+            --component rustc-dev \
+            --component rust-src
       - name: Install cargo-binstall
         if: ${{ env.USE_SCCACHE == 'true' }}
         uses: cargo-bins/cargo-binstall@v1.19.1
