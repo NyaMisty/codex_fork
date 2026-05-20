@@ -49,6 +49,9 @@ concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
 
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
 jobs:
   tag-check:
     runs-on: ubuntu-latest
@@ -526,7 +529,27 @@ jobs:
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
-          cargo build --target "$target" --release --timings --bin bwrap
+          cargo_with_retry() {
+            local attempt
+            local status
+            for attempt in 1 2; do
+              if cargo "$@"; then
+                return 0
+              else
+                status=$?
+              fi
+              if (( attempt == 1 )) && [[ "${USE_SCCACHE:-}" == "true" ]] && command -v sccache >/dev/null 2>&1; then
+                echo "cargo command failed with status ${status}; restarting sccache and retrying once"
+                sccache --stop-server || true
+                sccache --start-server || true
+                sccache --show-stats || true
+              else
+                return "$status"
+              fi
+            done
+          }
+
+          cargo_with_retry build --target "$target" --release --timings --bin bwrap
 
           bwrap_path="target/${target}/release/bwrap"
           if [[ ! -f "$bwrap_path" ]]; then
@@ -541,6 +564,7 @@ jobs:
       - name: Cargo build
         shell: bash
         run: |
+          set -euo pipefail
           build_args=()
           for binary in ${{ matrix.binaries }}; do
             build_args+=(--bin "$binary")
@@ -548,7 +572,27 @@ jobs:
           echo "CARGO_PROFILE_RELEASE_LTO: ${CARGO_PROFILE_RELEASE_LTO}"
           echo "CARGO_PROFILE_RELEASE_DEBUG: ${CARGO_PROFILE_RELEASE_DEBUG}"
           echo "CARGO_PROFILE_RELEASE_STRIP: ${CARGO_PROFILE_RELEASE_STRIP}"
-          cargo build --target ${{ matrix.target }} --release --timings "${build_args[@]}"
+          cargo_with_retry() {
+            local attempt
+            local status
+            for attempt in 1 2; do
+              if cargo "$@"; then
+                return 0
+              else
+                status=$?
+              fi
+              if (( attempt == 1 )) && [[ "${USE_SCCACHE:-}" == "true" ]] && command -v sccache >/dev/null 2>&1; then
+                echo "cargo command failed with status ${status}; restarting sccache and retrying once"
+                sccache --stop-server || true
+                sccache --start-server || true
+                sccache --show-stats || true
+              else
+                return "$status"
+              fi
+            done
+          }
+
+          cargo_with_retry build --target ${{ matrix.target }} --release --timings "${build_args[@]}"
 
       - name: Upload Cargo timings
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
