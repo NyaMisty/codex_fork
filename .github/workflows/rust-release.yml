@@ -1054,6 +1054,9 @@ jobs:
   build-windows:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.release_mode != 'promote_signed' }}
     needs: tag-check
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/rust-release-windows.yml
     with:
       # Hosted Windows runners OOM with release LTO plus full debug symbols.
