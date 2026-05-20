@@ -66,12 +66,19 @@ jobs:
         with:
           toolchain: nightly-2025-09-18
           components: llvm-tools-preview, rustc-dev, rust-src
-      - name: Install sccache
-        id: install_sccache
+      - name: Install cargo-binstall
         if: ${{ env.USE_SCCACHE == 'true' }}
         uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
-          tool: sccache@0.15.0
+          tool: cargo-binstall
+      - name: Install sccache
+        id: install_sccache
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo binstall -y sccache@0.15.0
+          sccache --version
       - name: Configure sccache GitHub cache variables
         if: ${{ env.USE_SCCACHE == 'true' }}
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
@@ -254,10 +261,10 @@ jobs:
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_GHA_ENABLED: "true"
       CARGO_PROFILE_DEV_DEBUG: "full"
-      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'windows') && 'packed' || 'off' }}
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
       CARGO_PROFILE_DEV_STRIP: "none"
       CARGO_PROFILE_RELEASE_DEBUG: "full"
-      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'windows') && 'packed' || 'off' }}
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
       CARGO_PROFILE_RELEASE_STRIP: "none"
       # In rust-ci, representative release-profile checks use thin LTO for faster feedback.
       # Windows hosted runners have hit rustc/LLVM OOM with LTO while still using
@@ -417,12 +424,19 @@ jobs:
             cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-
 
       # Install sccache and use its GitHub Actions backend directly.
-      - name: Install sccache
-        id: install_sccache
+      - name: Install cargo-binstall
         if: ${{ env.USE_SCCACHE == 'true' }}
         uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
-          tool: sccache@0.15.0
+          tool: cargo-binstall
+      - name: Install sccache
+        id: install_sccache
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo binstall -y sccache@0.15.0
+          sccache --version
 
       - name: Configure sccache GitHub cache variables
         if: ${{ env.USE_SCCACHE == 'true' }}
@@ -1296,12 +1310,19 @@ jobs:
           restore-keys: |
             cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-
 
-      - name: Install sccache
-        id: install_sccache
+      - name: Install cargo-binstall
         if: ${{ env.USE_SCCACHE == 'true' }}
         uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
-          tool: sccache@0.15.0
+          tool: cargo-binstall
+      - name: Install sccache
+        id: install_sccache
+        if: ${{ env.USE_SCCACHE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo binstall -y sccache@0.15.0
+          sccache --version
 
       - name: Configure sccache GitHub cache variables
         if: ${{ env.USE_SCCACHE == 'true' }}
@@ -1365,8 +1386,7 @@ jobs:
 
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
-          tool: nextest
-          version: 0.9.103
+          tool: nextest@0.9.103
 
       - name: Enable unprivileged user namespaces (Linux)
         if: runner.os == 'Linux'
