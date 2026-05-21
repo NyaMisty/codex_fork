@@ -163,9 +163,9 @@ jobs:
       CARGO_PROFILE_RELEASE_DEBUG: "full"
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
       CARGO_PROFILE_RELEASE_STRIP: "none"
-      # 2026-03-04: temporarily change releases to use thin LTO because
-      # Ubuntu ARM is timing out at 60 minutes.
-      CARGO_PROFILE_RELEASE_LTO: ${{ contains(github.ref_name, '-alpha') && 'thin' || 'thin' }}
+      # Keep release artifacts on the release profile with full symbols, but
+      # avoid long LTO phases that hosted runners can terminate before staging.
+      CARGO_PROFILE_RELEASE_LTO: "off"
       SIGN_MACOS: ${{ github.event_name != 'workflow_dispatch' }}
 
     strategy:

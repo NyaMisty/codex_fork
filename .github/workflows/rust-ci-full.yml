@@ -276,10 +276,10 @@ jobs:
       CARGO_PROFILE_RELEASE_DEBUG: "full"
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
       CARGO_PROFILE_RELEASE_STRIP: "none"
-      # In rust-ci, representative release-profile checks use thin LTO for faster feedback.
-      # Windows hosted runners have hit rustc/LLVM OOM with LTO while still using
-      # the release profile and full symbols, so avoid LTO only for that case.
-      CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && contains(matrix.target, 'windows') && 'off' || matrix.profile == 'release' && 'thin' || 'fat' }}
+      # Full CI release artifacts are meant to prove release-profile packaging
+      # with full symbols. LTO adds long rustc/LLVM phases that hosted runners
+      # have repeatedly terminated before artifacts can be staged.
+      CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && 'off' || 'fat' }}
 
     strategy:
       fail-fast: false
