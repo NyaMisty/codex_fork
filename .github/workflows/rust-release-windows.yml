@@ -188,11 +188,34 @@ jobs:
       - name: Cargo build (Windows binaries)
         shell: bash
         run: |
+          set -euo pipefail
           build_args=()
           for binary in ${{ matrix.binaries }}; do
             build_args+=(--bin "$binary")
           done
-          cargo build --target ${{ matrix.target }} --release --timings "${build_args[@]}"
+
+          cargo_with_retry() {
+            local attempt
+            local status
+            for attempt in 1 2; do
+              if cargo "$@"; then
+                return 0
+              else
+                status=$?
+              fi
+              if (( attempt == 1 )) && [[ "${USE_SCCACHE:-}" == "true" ]] && command -v sccache >/dev/null 2>&1; then
+                echo "cargo command failed with status ${status}; restarting sccache and retrying once"
+                sccache --show-stats || true
+                sccache --stop-server || true
+                sccache --start-server || true
+                sccache --show-stats || true
+              else
+                return "$status"
+              fi
+            done
+          }
+
+          cargo_with_retry build --target ${{ matrix.target }} --release --timings "${build_args[@]}"
           sccache --show-stats || true
 
       - name: Upload Cargo timings
@@ -424,6 +447,26 @@ jobs:
           dest="dist/${{ matrix.target }}"
           mkdir -p "$dest"
 
+          file_size() {
+            wc -c < "$1" | tr -d '[:space:]'
+          }
+
+          require_file_min_size() {
+            local file="$1"
+            local min_size="$2"
+            if [[ ! -f "$file" ]]; then
+              echo "required Windows artifact file is missing: $file"
+              exit 1
+            fi
+
+            local size
+            size="$(file_size "$file")"
+            if (( size < min_size )); then
+              echo "Windows artifact file $file is only ${size} bytes; expected at least ${min_size} bytes"
+              exit 1
+            fi
+          }
+
           stage_pdb() {
             local binary="$1"
             local candidate
@@ -445,11 +488,17 @@ jobs:
             fi
 
             cp "$pdb_source" "$dest/${binary}-${{ matrix.target }}.pdb"
+            require_file_min_size "$dest/${binary}-${{ matrix.target }}.pdb" 1000000
           }
 
           for binary in ${WINDOWS_BINARIES}; do
-            cp "target/${{ matrix.target }}/release/${binary}.exe" \
-              "$dest/${binary}-${{ matrix.target }}.exe"
+            staged_exe="$dest/${binary}-${{ matrix.target }}.exe"
+            cp "target/${{ matrix.target }}/release/${binary}.exe" "$staged_exe"
+            min_size=100000
+            if [[ "$binary" == "codex" ]]; then
+              min_size=50000000
+            fi
+            require_file_min_size "$staged_exe" "$min_size"
             stage_pdb "$binary"
           done
 

@@ -116,7 +116,7 @@ jobs:
             echo "::warning title=Deprecated sign_macos input ignored::Use release_mode=build_unsigned or release_mode=promote_signed instead."
           fi
 
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${RELEASE_MODE}" == "build_unsigned" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             echo "Manual artifact-only build; skipping tag/version validation."
             echo "::endgroup::"
             exit 0
@@ -1342,6 +1342,179 @@ jobs:
 
           target="${{ matrix.target }}"
           artifact_name="${{ matrix.artifact_name }}"
+
+          file_size() {
+            wc -c < "$1" | tr -d '[:space:]'
+          }
+
+          tree_size() {
+            local total=0
+            local size
+            local file
+            while IFS= read -r -d '' file; do
+              size="$(file_size "$file")"
+              total=$((total + size))
+            done < <(find "$1" -type f -print0)
+            echo "$total"
+          }
+
+          require_file_min_size() {
+            local file="$1"
+            local min_size="$2"
+            if [[ ! -f "$file" ]]; then
+              echo "required signed macOS artifact file is missing: $file"
+              exit 1
+            fi
+
+            local size
+            size="$(file_size "$file")"
+            if (( size < min_size )); then
+              echo "signed macOS artifact file $file is only ${size} bytes; expected at least ${min_size} bytes"
+              exit 1
+            fi
+          }
+
+          require_macos_dsym() {
+            local dsym_dir="$1"
+            if [[ ! -d "$dsym_dir" ]]; then
+              echo "required macOS dSYM bundle is missing: $dsym_dir"
+              return 1
+            fi
+            local dsym_size
+            dsym_size="$(tree_size "$dsym_dir")"
+            if (( dsym_size < 1000000 )); then
+              echo "macOS dSYM bundle $dsym_dir totals only ${dsym_size} bytes; expected at least 1000000 bytes"
+              return 1
+            fi
+            local dwarf_file
+            dwarf_file="$(find "$dsym_dir/Contents/Resources/DWARF" -maxdepth 1 -type f -print -quit 2>/dev/null || true)"
+            if [[ -z "$dwarf_file" ]]; then
+              echo "macOS dSYM bundle does not contain a DWARF file: $dsym_dir"
+              return 1
+            fi
+            if ! command -v dwarfdump >/dev/null 2>&1; then
+              echo "No tool available to verify macOS dSYM debug info for $dsym_dir"
+              return 1
+            fi
+            if ! dwarfdump --uuid "$dwarf_file" 2>/dev/null | grep -q 'UUID'; then
+              echo "macOS dSYM is missing a DWARF UUID: $dsym_dir"
+              return 1
+            fi
+          }
+
+          has_macos_debug_info() {
+            local file="$1"
+            command -v dwarfdump >/dev/null 2>&1 || return 1
+            dwarfdump --debug-info "$file" 2>/dev/null | grep -q 'DW_TAG_compile_unit'
+          }
+
+          has_macos_symbol_table() {
+            local file="$1"
+            command -v nm >/dev/null 2>&1 || return 1
+            nm -m "$file" >/dev/null 2>&1
+          }
+
+          compress_directory() {
+            local dir="$1"
+            local base
+            local parent
+            base="$(basename "$dir")"
+            parent="$(dirname "$dir")"
+            tar -C "$parent" -czf "$dest/${base}.tar.gz" "$base"
+            tar -C "$parent" -cf - "$base" | zstd -f -T0 -19 -o "$dest/${base}.tar.zst"
+          }
+
+          validate_dsym_archive() {
+            local archive="$1"
+            local tmp_dir
+            local dsym_dir
+            tmp_dir="$(mktemp -d)"
+            case "$archive" in
+              *.tar.gz|*.tgz)
+                tar -C "$tmp_dir" -xzf "$archive"
+                ;;
+              *.tar.zst)
+                zstd -dc "$archive" | tar -C "$tmp_dir" -xf -
+                ;;
+              *)
+                rm -rf "$tmp_dir"
+                return 1
+                ;;
+            esac
+            dsym_dir="$(find "$tmp_dir" -type d -name '*.dSYM' -print -quit 2>/dev/null || true)"
+            if [[ -z "$dsym_dir" ]]; then
+              echo "macOS dSYM archive does not contain a .dSYM bundle: $archive"
+              rm -rf "$tmp_dir"
+              return 1
+            fi
+            if require_macos_dsym "$dsym_dir"; then
+              rm -rf "$tmp_dir"
+              return 0
+            fi
+            rm -rf "$tmp_dir"
+            return 1
+          }
+
+          stage_macos_dsym() {
+            local binary="$1"
+            local source_path="$2"
+            local release_path="$3"
+            local dsym_dest="${release_path}.dSYM"
+            local candidate
+
+            for candidate in \
+              "${source_path}.dSYM" \
+              "${source_dir}/${binary}.dSYM" \
+              "${source_dir}/${binary}-${target}.dSYM"; do
+              if [[ -d "$candidate" ]]; then
+                rm -rf "$dsym_dest"
+                cp -R "$candidate" "$dsym_dest"
+                if require_macos_dsym "$dsym_dest"; then
+                  compress_directory "$dsym_dest"
+                  rm -rf "$dsym_dest"
+                  return 0
+                fi
+                rm -rf "$dsym_dest"
+              fi
+            done
+
+            for candidate in \
+              "${source_path}.dSYM.tar.gz" \
+              "${source_path}.dSYM.tar.zst" \
+              "${source_dir}/${binary}.dSYM.tar.gz" \
+              "${source_dir}/${binary}.dSYM.tar.zst" \
+              "${source_dir}/${binary}-${target}.dSYM.tar.gz" \
+              "${source_dir}/${binary}-${target}.dSYM.tar.zst"; do
+              if [[ -f "$candidate" ]] && validate_dsym_archive "$candidate"; then
+                case "$candidate" in
+                  *.tar.gz|*.tgz)
+                    cp "$candidate" "${dsym_dest}.tar.gz"
+                    ;;
+                  *.tar.zst)
+                    cp "$candidate" "${dsym_dest}.tar.zst"
+                    ;;
+                esac
+                return 0
+              fi
+            done
+
+            return 1
+          }
+
+          require_macos_symbols() {
+            local binary="$1"
+            local source_path="$2"
+            local file="$3"
+            if stage_macos_dsym "$binary" "$source_path" "$file"; then
+              return 0
+            fi
+            if has_macos_debug_info "$file" || has_macos_symbol_table "$file"; then
+              return 0
+            fi
+            echo "signed macOS artifact is missing embedded DWARF debug info and symbol table: $file"
+            exit 1
+          }
+
           source_dir="${SIGNED_MACOS_HANDOFF_DIR}/${artifact_name}"
           if [[ ! -d "$source_dir" && -d "${SIGNED_MACOS_HANDOFF_DIR}/dist/${artifact_name}" ]]; then
             source_dir="${SIGNED_MACOS_HANDOFF_DIR}/dist/${artifact_name}"
@@ -1379,6 +1552,12 @@ jobs:
             release_path="${dest}/${binary}-${target}"
             ditto "$source_path" "$release_path"
             chmod 0755 "$release_path"
+            min_size=100000
+            if [[ "$binary" == "codex" ]]; then
+              min_size=50000000
+            fi
+            require_file_min_size "$release_path" "$min_size"
+            require_macos_symbols "$binary" "$source_path" "$release_path"
             codesign --verify --strict --verbose=2 "$release_path"
           done
 
@@ -1404,6 +1583,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          codex_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')"
+
           case "${{ matrix.target }}" in
             aarch64-apple-darwin)
               platform_tag="macosx_11_0_arm64"
@@ -1427,7 +1608,7 @@ jobs:
             stage-runtime \
             "$stage_dir" \
             "${GITHUB_WORKSPACE}/codex-rs/dist/${{ matrix.target }}/codex-${{ matrix.target }}" \
-            --codex-version "${GITHUB_REF_NAME}" \
+            --codex-version "$codex_version" \
             --platform-tag "$platform_tag"
           "${RUNNER_TEMP}/python-runtime-build-venv/bin/python" -m build --wheel --outdir "$wheel_dir" "$stage_dir"
 
@@ -1500,14 +1681,25 @@ jobs:
     if: >-
       ${{
         always() &&
-        github.event_name != 'workflow_dispatch' &&
         needs.tag-check.result == 'success' &&
         (
-          needs.build.result == 'success' &&
-          needs.stage-signed-macos.result == 'skipped' &&
-          needs.build-windows.result == 'success' &&
-          needs.argument-comment-lint-release-assets.result == 'success' &&
-          needs.zsh-release-assets.result == 'success'
+          (
+            github.event_name != 'workflow_dispatch' &&
+            needs.build.result == 'success' &&
+            needs.stage-signed-macos.result == 'skipped' &&
+            needs.build-windows.result == 'success' &&
+            needs.argument-comment-lint-release-assets.result == 'success' &&
+            needs.zsh-release-assets.result == 'success'
+          ) ||
+          (
+            github.event_name == 'workflow_dispatch' &&
+            inputs.release_mode == 'promote_signed' &&
+            needs.build.result == 'skipped' &&
+            needs.stage-signed-macos.result == 'success' &&
+            needs.build-windows.result == 'skipped' &&
+            needs.argument-comment-lint-release-assets.result == 'skipped' &&
+            needs.zsh-release-assets.result == 'skipped'
+          )
         )
       }}
     name: release
@@ -1541,6 +1733,7 @@ jobs:
           echo "sign_macos=${SIGN_MACOS}" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes from tag commit message
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         id: release_notes
         shell: bash
         run: |
@@ -1697,12 +1890,17 @@ jobs:
       - name: Define release name
         id: release_name
         run: |
-          # Extract the version from the tag name, which is in the format
-          # "rust-v0.1.0".
-          version="${GITHUB_REF_NAME#rust-v}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="$(grep -m1 '^version' codex-rs/Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')"
+          else
+            # Extract the version from the tag name, which is in the format
+            # "rust-v0.1.0".
+            version="${GITHUB_REF_NAME#rust-v}"
+          fi
           echo "name=${version}" >> $GITHUB_OUTPUT
 
       - name: Determine npm publish settings
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         id: npm_publish_settings
         env:
           VERSION: ${{ steps.release_name.outputs.name }}
@@ -1728,6 +1926,7 @@ jobs:
           fi
 
       - name: Determine Python runtime publish settings
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         id: python_runtime_publish_settings
         env:
           VERSION: ${{ steps.release_name.outputs.name }}
@@ -1765,7 +1964,8 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # stage_npm_packages.py requires DotSlash when staging releases.
-      - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
+      - if: ${{ env.SIGN_MACOS == 'true' }}
+        uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
       - name: Stage npm packages
         if: ${{ env.SIGN_MACOS == 'true' }}
         env:
@@ -1785,6 +1985,14 @@ jobs:
         run: |
           cp scripts/install/install.sh dist/install.sh
           cp scripts/install/install.ps1 dist/install.ps1
+
+      - name: Upload promoted release artifacts
+        if: ${{ github.event_name == 'workflow_dispatch' && env.RELEASE_MODE == 'promote_signed' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: promoted-release-artifacts
+          path: dist/**
+          if-no-files-found: error
 
       - name: Create GitHub Release
         if: ${{ github.event_name != 'workflow_dispatch' }}
