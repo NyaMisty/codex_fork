@@ -159,6 +159,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_IDLE_TIMEOUT: "0"
       SCCACHE_GHA_ENABLED: "true"
       CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
@@ -560,6 +561,7 @@ jobs:
               fi
               if (( attempt == 1 )) && [[ "${USE_SCCACHE:-}" == "true" ]] && command -v sccache >/dev/null 2>&1; then
                 echo "cargo command failed with status ${status}; restarting sccache and retrying once"
+                sccache --show-stats || true
                 sccache --stop-server || true
                 sccache --start-server || true
                 sccache --show-stats || true
@@ -570,6 +572,7 @@ jobs:
           }
 
           cargo_with_retry build --target "$target" --release --timings --bin bwrap
+          sccache --show-stats || true
 
           bwrap_path="target/${target}/release/bwrap"
           if [[ ! -f "$bwrap_path" ]]; then
@@ -603,6 +606,7 @@ jobs:
               fi
               if (( attempt == 1 )) && [[ "${USE_SCCACHE:-}" == "true" ]] && command -v sccache >/dev/null 2>&1; then
                 echo "cargo command failed with status ${status}; restarting sccache and retrying once"
+                sccache --show-stats || true
                 sccache --stop-server || true
                 sccache --start-server || true
                 sccache --show-stats || true
@@ -613,6 +617,7 @@ jobs:
           }
 
           cargo_with_retry build --target ${{ matrix.target }} --release --timings "${build_args[@]}"
+          sccache --show-stats || true
 
       - name: Verify release binaries
         shell: bash

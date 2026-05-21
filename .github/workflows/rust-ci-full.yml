@@ -57,6 +57,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_IDLE_TIMEOUT: "0"
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -169,7 +170,11 @@ jobs:
         run: python3 -m unittest discover -s tools/argument-comment-lint -p 'test_*.py'
       - name: Test argument comment lint package
         working-directory: tools/argument-comment-lint
-        run: cargo test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test
+          sccache --show-stats || true
         env:
           RUST_MIN_STACK: "8388608" # 8 MiB
       - name: sccache stats
@@ -269,6 +274,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_IDLE_TIMEOUT: "0"
       SCCACHE_GHA_ENABLED: "true"
       CARGO_PROFILE_DEV_DEBUG: "full"
       CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
@@ -660,11 +666,19 @@ jobs:
 
       - name: cargo clippy (debug/dev)
         if: ${{ matrix.profile == 'dev' }}
-        run: cargo clippy --target ${{ matrix.target }} --tests --profile dev --timings -- -D warnings
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --target ${{ matrix.target }} --tests --profile dev --timings -- -D warnings
+          sccache --show-stats || true
 
       - name: cargo clippy (release)
         if: ${{ matrix.profile == 'release' && matrix.artifact != true }}
-        run: cargo clippy --target ${{ matrix.target }} --tests --release --timings -- -D warnings
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --target ${{ matrix.target }} --tests --release --timings -- -D warnings
+          sccache --show-stats || true
 
       - name: Upload Cargo timings (clippy)
         if: ${{ always() && (matrix.profile == 'dev' || (matrix.profile == 'release' && matrix.artifact != true)) }}
@@ -712,6 +726,7 @@ jobs:
               fi
               if (( attempt == 1 )) && [[ "${USE_SCCACHE:-}" == "true" ]] && command -v sccache >/dev/null 2>&1; then
                 echo "cargo command failed with status ${status}; restarting sccache and retrying once"
+                sccache --show-stats || true
                 sccache --stop-server || true
                 sccache --start-server || true
                 sccache --show-stats || true
@@ -730,6 +745,7 @@ jobs:
 
           if [[ "$target" == *linux* ]]; then
             cargo_with_retry build --target "$target" "${profile_args[@]}" --locked --timings --bin bwrap
+            sccache --show-stats || true
             bwrap_path="${release_target_dir}/${target}/${profile_dir}/bwrap"
             if [[ ! -f "$bwrap_path" ]]; then
               echo "bwrap binary ${bwrap_path} not found"
@@ -745,6 +761,7 @@ jobs:
           fi
 
           cargo_with_retry build --target "$target" "${profile_args[@]}" --locked --timings "${build_args[@]}"
+          sccache --show-stats || true
 
           echo "Built ${profile} binary sizes:"
           for binary in "${built_bins[@]}"; do
@@ -1250,6 +1267,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_IDLE_TIMEOUT: "0"
       SCCACHE_GHA_ENABLED: "true"
 
     strategy:
@@ -1467,6 +1485,7 @@ jobs:
               --cargo-profile ci-test \
               --timings
           fi
+          sccache --show-stats || true
         env:
           RUST_BACKTRACE: 1
           RUST_MIN_STACK: "8388608" # 8 MiB
