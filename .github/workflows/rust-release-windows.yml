@@ -41,7 +41,7 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_GHA_ENABLED: "true"
-      CARGO_PROFILE_RELEASE_DEBUG: "full"
+      CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "packed"
       CARGO_PROFILE_RELEASE_STRIP: "none"
       CARGO_PROFILE_RELEASE_LTO: ${{ inputs.release-lto }}
@@ -238,6 +238,26 @@ jobs:
           output_dir="target/${{ matrix.target }}/release/staged-${{ matrix.bundle }}"
           mkdir -p "$output_dir"
 
+          file_size() {
+            wc -c < "$1" | tr -d '[:space:]'
+          }
+
+          require_file_min_size() {
+            local file="$1"
+            local min_size="$2"
+            if [[ ! -f "$file" ]]; then
+              echo "required Windows artifact file is missing: $file"
+              exit 1
+            fi
+
+            local size
+            size="$(file_size "$file")"
+            if (( size < min_size )); then
+              echo "Windows artifact file $file is only ${size} bytes; expected at least ${min_size} bytes"
+              exit 1
+            fi
+          }
+
           stage_pdb() {
             local binary="$1"
             local candidate
@@ -259,10 +279,16 @@ jobs:
             fi
 
             cp "$pdb_source" "$output_dir/${binary}.pdb"
+            require_file_min_size "$output_dir/${binary}.pdb" 1000000
           }
 
           for binary in ${{ matrix.binaries }}; do
             cp "target/${{ matrix.target }}/release/${binary}.exe" "$output_dir/${binary}.exe"
+            min_size=100000
+            if [[ "$binary" == "codex" ]]; then
+              min_size=50000000
+            fi
+            require_file_min_size "$output_dir/${binary}.exe" "$min_size"
             stage_pdb "$binary"
           done
 
@@ -327,8 +353,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          file_size() {
+            wc -c < "$1" | tr -d '[:space:]'
+          }
+
+          require_file_min_size() {
+            local file="$1"
+            local min_size="$2"
+            if [[ ! -f "$file" ]]; then
+              echo "required Windows artifact file is missing: $file"
+              exit 1
+            fi
+
+            local size
+            size="$(file_size "$file")"
+            if (( size < min_size )); then
+              echo "Windows artifact file $file is only ${size} bytes; expected at least ${min_size} bytes"
+              exit 1
+            fi
+          }
+
           for binary in ${WINDOWS_BINARIES}; do
-            ls -lh "target/${{ matrix.target }}/release/${binary}.exe"
+            exe_path="target/${{ matrix.target }}/release/${binary}.exe"
+            min_size=100000
+            if [[ "$binary" == "codex" ]]; then
+              min_size=50000000
+            fi
+            require_file_min_size "$exe_path" "$min_size"
+            ls -lh "$exe_path"
             pdb_candidates=(
               "target/${{ matrix.target }}/release/${binary}.pdb"
               "target/${{ matrix.target }}/release/deps/${binary}.pdb"
@@ -346,6 +398,7 @@ jobs:
               echo "missing PDB for ${binary}"
               exit 1
             fi
+            require_file_min_size "$found_pdb" 1000000
             ls -lh "$found_pdb"
           done
 

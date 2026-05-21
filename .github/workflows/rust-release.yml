@@ -160,11 +160,12 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_GHA_ENABLED: "true"
-      CARGO_PROFILE_RELEASE_DEBUG: "full"
-      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
       CARGO_PROFILE_RELEASE_STRIP: "none"
-      # Keep release artifacts on the release profile with full symbols, but
-      # avoid long LTO phases that hosted runners can terminate before staging.
+      # Keep release artifacts on the release profile with unstripped binaries
+      # and symbol files, but avoid long LTO phases that hosted runners can
+      # terminate before staging.
       CARGO_PROFILE_RELEASE_LTO: "off"
       SIGN_MACOS: ${{ github.event_name != 'workflow_dispatch' }}
 
@@ -423,6 +424,16 @@ jobs:
         shell: bash
         run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
+      - name: Ensure zstd for artifact compression
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v zstd >/dev/null 2>&1; then
+            brew install zstd
+          fi
+          zstd -V
+
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -603,6 +614,107 @@ jobs:
 
           cargo_with_retry build --target ${{ matrix.target }} --release --timings "${build_args[@]}"
 
+      - name: Verify release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          release_dir="target/${target}/release"
+
+          file_size() {
+            wc -c < "$1" | tr -d '[:space:]'
+          }
+
+          require_file_min_size() {
+            local file="$1"
+            local min_size="$2"
+            if [[ ! -f "$file" ]]; then
+              echo "required release binary is missing: $file"
+              exit 1
+            fi
+
+            local size
+            size="$(file_size "$file")"
+            if (( size < min_size )); then
+              echo "release binary $file is only ${size} bytes; expected at least ${min_size} bytes"
+              exit 1
+            fi
+          }
+
+          has_macos_dsym() {
+            local binary="$1"
+            local source_dir
+            local source_base
+            source_dir="$(dirname "$binary")"
+            source_base="$(basename "$binary")"
+            if [[ -d "${source_dir}/${source_base}.dSYM" ]]; then
+              return 0
+            fi
+            return 1
+          }
+
+          has_macos_debug_info() {
+            local binary="$1"
+            command -v dwarfdump >/dev/null 2>&1 || return 1
+            dwarfdump --debug-info "$binary" 2>/dev/null | grep -q 'DW_TAG_compile_unit'
+          }
+
+          has_macos_symbol_table() {
+            local binary="$1"
+            command -v nm >/dev/null 2>&1 || return 1
+            nm -m "$binary" >/dev/null 2>&1
+          }
+
+          require_symbols() {
+            local file="$1"
+            if [[ "$target" == *apple-darwin* ]]; then
+              if has_macos_dsym "$file" || has_macos_debug_info "$file" || has_macos_symbol_table "$file"; then
+                return 0
+              fi
+              echo "macOS release binary is missing dSYM, embedded DWARF debug info, and symbol table: $file"
+              exit 1
+            fi
+
+            if [[ "$target" != *linux* ]]; then
+              return 0
+            fi
+
+            if command -v file >/dev/null 2>&1; then
+              file_output="$(file "$file")"
+              echo "$file_output"
+              if grep -qi 'stripped' <<<"$file_output" && ! grep -qi 'not stripped' <<<"$file_output"; then
+                echo "release binary is stripped but symbols are required: $file"
+                exit 1
+              fi
+            fi
+
+            if command -v readelf >/dev/null 2>&1; then
+              if ! readelf -S "$file" 2>/dev/null | grep -Eq '\.debug_(info|line)'; then
+                echo "release binary is missing .debug_info/.debug_line: $file"
+                exit 1
+              fi
+            elif command -v objdump >/dev/null 2>&1; then
+              if ! objdump -h "$file" 2>/dev/null | grep -Eq '\.debug_(info|line)'; then
+                echo "release binary is missing .debug_info/.debug_line: $file"
+                exit 1
+              fi
+            else
+              echo "No tool available to verify debug symbols for $file"
+              exit 1
+            fi
+          }
+
+          for binary in ${{ matrix.binaries }}; do
+            path="${release_dir}/${binary}"
+            min_size=100000
+            if [[ "$binary" == "codex" ]]; then
+              min_size=50000000
+            fi
+            require_file_min_size "$path" "$min_size"
+            require_symbols "$path"
+            printf '%12s  %s\n' "$(file_size "$path")" "$path"
+          done
+
       - name: Upload Cargo timings
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -621,6 +733,76 @@ jobs:
           dest="unsigned-dist/${target}"
           mkdir -p "$dest"
 
+          tree_size() {
+            local total=0
+            local size
+            local file
+            while IFS= read -r -d '' file; do
+              size="$(wc -c < "$file" | tr -d '[:space:]')"
+              total=$((total + size))
+            done < <(find "$1" -type f -print0)
+            echo "$total"
+          }
+
+          require_macos_dsym() {
+            local dsym_dir="$1"
+            if [[ ! -d "$dsym_dir" ]]; then
+              echo "required macOS dSYM bundle is missing: $dsym_dir"
+              return 1
+            fi
+            local dsym_size
+            dsym_size="$(tree_size "$dsym_dir")"
+            if (( dsym_size < 1000000 )); then
+              echo "macOS dSYM bundle $dsym_dir totals only ${dsym_size} bytes; expected at least 1000000 bytes"
+              return 1
+            fi
+            local dwarf_file
+            dwarf_file="$(find "$dsym_dir/Contents/Resources/DWARF" -maxdepth 1 -type f -print -quit 2>/dev/null || true)"
+            if [[ -z "$dwarf_file" ]]; then
+              echo "macOS dSYM bundle does not contain a DWARF file: $dsym_dir"
+              return 1
+            fi
+            if ! dwarfdump --uuid "$dwarf_file" 2>/dev/null | grep -q 'UUID'; then
+              echo "macOS dSYM is missing a DWARF UUID: $dsym_dir"
+              return 1
+            fi
+          }
+
+          compress_directory() {
+            local dir="$1"
+            local base
+            local parent
+            base="$(basename "$dir")"
+            parent="$(dirname "$dir")"
+            tar -C "$parent" -czf "$dest/${base}.tar.gz" "$base"
+            tar -C "$parent" -cf - "$base" | zstd -f -T0 -19 -o "$dest/${base}.tar.zst"
+          }
+
+          stage_macos_dsym() {
+            local source="$1"
+            local staged_binary="$2"
+            local source_dir
+            local source_base
+            source_dir="$(dirname "$source")"
+            source_base="$(basename "$source")"
+            local dsym_dest="${staged_binary}.dSYM"
+            rm -rf "$dsym_dest"
+
+            local dsym_source=""
+            if [[ -d "${source_dir}/${source_base}.dSYM" ]]; then
+              dsym_source="${source_dir}/${source_base}.dSYM"
+            fi
+            if [[ -n "$dsym_source" ]]; then
+              cp -R "$dsym_source" "$dsym_dest"
+            else
+              dsymutil "$source" -o "$dsym_dest"
+            fi
+
+            require_macos_dsym "$dsym_dest"
+            compress_directory "$dsym_dest"
+            rm -rf "$dsym_dest"
+          }
+
           for binary in ${{ matrix.binaries }}; do
             binary_path="${release_dir}/${binary}"
             unsigned_name="${binary}-${target}-unsigned"
@@ -631,6 +813,7 @@ jobs:
             fi
 
             cp "${binary_path}" "${unsigned_path}"
+            stage_macos_dsym "${binary_path}" "${unsigned_path}"
             tar -C "$dest" -czf "${unsigned_path}.tar.gz" "${unsigned_name}"
             zstd -T0 -19 --rm "${unsigned_path}"
           done
@@ -722,14 +905,86 @@ jobs:
         if: ${{ runner.os != 'macOS' || env.SIGN_MACOS == 'true' }}
         shell: bash
         run: |
+          set -euo pipefail
+
+          target="${{ matrix.target }}"
           dest="dist/${{ matrix.target }}"
           mkdir -p "$dest"
+
+          tree_size() {
+            local total=0
+            local size
+            local file
+            while IFS= read -r -d '' file; do
+              size="$(wc -c < "$file" | tr -d '[:space:]')"
+              total=$((total + size))
+            done < <(find "$1" -type f -print0)
+            echo "$total"
+          }
+
+          require_macos_dsym() {
+            local dsym_dir="$1"
+            if [[ ! -d "$dsym_dir" ]]; then
+              echo "required macOS dSYM bundle is missing: $dsym_dir"
+              return 1
+            fi
+            local dsym_size
+            dsym_size="$(tree_size "$dsym_dir")"
+            if (( dsym_size < 1000000 )); then
+              echo "macOS dSYM bundle $dsym_dir totals only ${dsym_size} bytes; expected at least 1000000 bytes"
+              return 1
+            fi
+            local dwarf_file
+            dwarf_file="$(find "$dsym_dir/Contents/Resources/DWARF" -maxdepth 1 -type f -print -quit 2>/dev/null || true)"
+            if [[ -z "$dwarf_file" ]]; then
+              echo "macOS dSYM bundle does not contain a DWARF file: $dsym_dir"
+              return 1
+            fi
+            if ! dwarfdump --uuid "$dwarf_file" 2>/dev/null | grep -q 'UUID'; then
+              echo "macOS dSYM is missing a DWARF UUID: $dsym_dir"
+              return 1
+            fi
+          }
+
+          compress_macos_dsym() {
+            local dsym_dir="$1"
+            local base
+            local parent
+            base="$(basename "$dsym_dir")"
+            parent="$(dirname "$dsym_dir")"
+            tar -C "$parent" -czf "$dest/${base}.tar.gz" "$base"
+            tar -C "$parent" -cf - "$base" | zstd -f -T0 -19 -o "$dest/${base}.tar.zst"
+          }
+
+          stage_macos_dsym() {
+            local binary="$1"
+            local source="target/${target}/release/${binary}"
+            local staged="$dest/${binary}-${target}"
+            local dsym_dest="${staged}.dSYM"
+            rm -rf "$dsym_dest"
+
+            local dsym_source=""
+            if [[ -d "target/${target}/release/${binary}.dSYM" ]]; then
+              dsym_source="target/${target}/release/${binary}.dSYM"
+            fi
+            if [[ -n "$dsym_source" ]]; then
+              cp -R "$dsym_source" "$dsym_dest"
+            else
+              dsymutil "$source" -o "$dsym_dest"
+            fi
+
+            require_macos_dsym "$dsym_dest"
+            compress_macos_dsym "$dsym_dest"
+            rm -rf "$dsym_dest"
+          }
 
           for binary in ${{ matrix.binaries }}; do
             cp "target/${{ matrix.target }}/release/${binary}" "$dest/${binary}-${{ matrix.target }}"
             if [[ "${{ matrix.target }}" == *linux* ]]; then
               cp "target/${{ matrix.target }}/release/${binary}.sigstore" \
                 "$dest/${binary}-${{ matrix.target }}.sigstore"
+            elif [[ "${{ matrix.target }}" == *apple-darwin* ]]; then
+              stage_macos_dsym "$binary"
             fi
           done
 

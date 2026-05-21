@@ -273,12 +273,13 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "full"
       CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
       CARGO_PROFILE_DEV_STRIP: "none"
-      CARGO_PROFILE_RELEASE_DEBUG: "full"
+      CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ (contains(matrix.target, 'apple-darwin') || contains(matrix.target, 'windows')) && 'packed' || 'off' }}
       CARGO_PROFILE_RELEASE_STRIP: "none"
       # Full CI release artifacts are meant to prove release-profile packaging
-      # with full symbols. LTO adds long rustc/LLVM phases that hosted runners
-      # have repeatedly terminated before artifacts can be staged.
+      # with unstripped binaries and symbol files. LTO adds long rustc/LLVM
+      # phases that hosted runners have repeatedly terminated before artifacts
+      # can be staged.
       CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && 'off' || 'fat' }}
 
     strategy:
@@ -880,13 +881,13 @@ jobs:
             fi
 
             if command -v readelf >/dev/null 2>&1; then
-              if ! readelf -S "$file" 2>/dev/null | grep -q '\.debug_info'; then
-                echo "artifact binary is missing .debug_info: $file"
+              if ! readelf -S "$file" 2>/dev/null | grep -Eq '\.debug_(info|line)'; then
+                echo "artifact binary is missing .debug_info/.debug_line: $file"
                 exit 1
               fi
             elif command -v objdump >/dev/null 2>&1; then
-              if ! objdump -h "$file" 2>/dev/null | grep -q '\.debug_info'; then
-                echo "artifact binary is missing .debug_info: $file"
+              if ! objdump -h "$file" 2>/dev/null | grep -Eq '\.debug_(info|line)'; then
+                echo "artifact binary is missing .debug_info/.debug_line: $file"
                 exit 1
               fi
             else
@@ -977,7 +978,9 @@ jobs:
             rm -rf "$dsym_dest"
 
             local dsym_source=""
-            dsym_source="$(find "$source_dir" -maxdepth 2 -type d -name "${source_base}*.dSYM" -print -quit 2>/dev/null || true)"
+            if [[ -d "${source_dir}/${source_base}.dSYM" ]]; then
+              dsym_source="${source_dir}/${source_base}.dSYM"
+            fi
             if [[ -n "$dsym_source" ]]; then
               echo "Found macOS dSYM bundle: $dsym_source"
               cp -R "$dsym_source" "$dsym_dest"
