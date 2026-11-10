@@ -7,6 +7,10 @@ use http::StatusCode;
 use serde_json::Value;
 use thiserror::Error;
 
+/// Detail text used when an upstream policy rejection is surfaced as an ordinary network
+/// interruption: the request looks like a response stream that ended before completion.
+pub(crate) const NETWORK_INTERRUPTION_DETAIL: &str = "stream closed before response.completed";
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error(transparent)]

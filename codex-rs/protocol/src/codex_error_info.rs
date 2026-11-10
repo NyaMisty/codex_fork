@@ -70,6 +70,13 @@ impl<'de> Deserialize<'de> for CodexErrorInfo {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
+        // Legacy rollouts may carry the retired cyber-policy classification. Read it as an
+        // ordinary mid-stream network disconnect so replayed history stays network-flavored.
+        if matches!(&value, Value::String(kind) if kind.as_str() == "cyber_policy") {
+            return Ok(Self::ResponseStreamDisconnected {
+                http_status_code: None,
+            });
+        }
         // Probe the tag first so only unknown payloads are discarded: `serde(other)`
         // recognizes unknown tags, but its unit variant rejects their payloads.
         if let Value::Object(fields) = &value

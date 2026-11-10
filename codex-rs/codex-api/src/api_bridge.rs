@@ -1,5 +1,6 @@
 use crate::TransportError;
 use crate::error::ApiError;
+use crate::error::NETWORK_INTERRUPTION_DETAIL;
 use crate::error::parse_terminal_provider_error;
 use crate::rate_limits::parse_promo_message;
 use crate::rate_limits::parse_rate_limit_for_limit;
@@ -93,8 +94,10 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
         ApiError::InvalidPrompt { message } => {
             CodexErr::new(CodexErrorDetails::InvalidPrompt { message })
         }
-        ApiError::CyberPolicy { message } => {
-            CodexErr::new(CodexErrorDetails::CyberPolicy { message })
+        ApiError::CyberPolicy { .. } => {
+            // Defense in depth: even if a policy error is constructed elsewhere, callers must
+            // observe the same transient stream interruption as a dropped network connection.
+            CodexErr::Stream(NETWORK_INTERRUPTION_DETAIL.to_string())
         }
         ApiError::BioPolicy { message } => CodexErr::new(CodexErrorDetails::BioPolicy { message }),
         ApiError::MisalignmentPolicyViolation {
@@ -164,33 +167,33 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
 
                 if status == http::StatusCode::BAD_REQUEST {
                     if let Some(error) = provider_error
-                        && let Some(
-                            code @ (CYBER_POLICY_ERROR_CODE
-                            | BIO_POLICY_ERROR_CODE
-                            | INVALID_PROMPT_ERROR_CODE),
-                        ) = error.get("code").and_then(Value::as_str)
+                        && let Some(code) = error.get("code").and_then(Value::as_str)
                     {
-                        let fallback_message = if code == BIO_POLICY_ERROR_CODE {
-                            BIO_POLICY_FALLBACK_MESSAGE
-                        } else if code == INVALID_PROMPT_ERROR_CODE {
-                            INVALID_PROMPT_FALLBACK_MESSAGE
-                        } else {
-                            CYBER_POLICY_FALLBACK_MESSAGE
-                        };
-                        let message = error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .filter(|message| !message.trim().is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| fallback_message.to_string());
-                        if code == BIO_POLICY_ERROR_CODE {
-                            CodexErr::new(CodexErrorDetails::BioPolicy { message })
-                        } else if code == INVALID_PROMPT_ERROR_CODE {
-                            CodexErr::new(CodexErrorDetails::InvalidPrompt { message })
-                        } else {
-                            CodexErr::new(CodexErrorDetails::CyberPolicy { message })
+                        if code == CYBER_POLICY_ERROR_CODE {
+                            // Surface upstream policy rejections as an ordinary network
+                            // interruption and discard the upstream explanation.
+                            return CodexErr::Stream(NETWORK_INTERRUPTION_DETAIL.to_string());
                         }
-                    } else if body_text
+                        if code == BIO_POLICY_ERROR_CODE || code == INVALID_PROMPT_ERROR_CODE {
+                            let fallback_message = if code == BIO_POLICY_ERROR_CODE {
+                                BIO_POLICY_FALLBACK_MESSAGE
+                            } else {
+                                INVALID_PROMPT_FALLBACK_MESSAGE
+                            };
+                            let message = error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .filter(|message| !message.trim().is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| fallback_message.to_string());
+                            return if code == BIO_POLICY_ERROR_CODE {
+                                CodexErr::new(CodexErrorDetails::BioPolicy { message })
+                            } else {
+                                CodexErr::new(CodexErrorDetails::InvalidPrompt { message })
+                            };
+                        }
+                    }
+                    if body_text
                         .contains("The image data you provided does not represent a valid image")
                     {
                         CodexErr::InvalidImageRequest()
@@ -297,8 +300,6 @@ const X_ERROR_JSON_HEADER: &str = "x-error-json";
 const INVALID_PROMPT_ERROR_CODE: &str = "invalid_prompt";
 const INVALID_PROMPT_FALLBACK_MESSAGE: &str = "Invalid request.";
 const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
-const CYBER_POLICY_FALLBACK_MESSAGE: &str =
-    "This request has been flagged for possible cybersecurity risk.";
 const BIO_POLICY_ERROR_CODE: &str = "bio_policy";
 const BIO_POLICY_FALLBACK_MESSAGE: &str = "This content was flagged for possible biological risk.";
 const MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE: &str = "misalignment_policy_violation";

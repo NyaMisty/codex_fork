@@ -1,0 +1,118 @@
+name: build-codex-macos-arm64
+
+on:
+  push:
+    branches:
+      - build/macos-arm64-cyber-net-error
+    paths:
+      - ".github/workflows/build-codex-macos-arm64.yml"
+      - "codex-rs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-codex-macos-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # GitHub-hosted Apple Silicon runner (free for public repositories).
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: "0"
+      # Keep the build within the standard runner's memory/disk budget. The resulting
+      # binary is still fully optimized; it just omits LTO and debug info.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_STRIP: "true"
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # OpenAI publishes sandbox-enabled V8 archives that upstream rusty_v8 does not.
+      RUSTY_V8_ARCHIVE: ${{ runner.temp }}/v8/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz
+      RUSTY_V8_ARCHIVE_SHA256: "feab9ae0384bebaa99c1d000654462c9d42123d587185c7876aaeef7d76ff749"
+      RUSTY_V8_SRC_BINDING_PATH: ${{ runner.temp }}/v8/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Runner info and free disk space
+        run: |
+          uname -a
+          sw_vers
+          df -h /
+          sysctl -n hw.memsize hw.ncpu || true
+          # Simulator runtimes are not needed for a Rust CLI build and consume
+          # several gigabytes on the standard macOS runner image.
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Caches/* || true
+          rm -rf ~/Library/Developer/Xcode/DerivedData/* || true
+          df -h /
+
+      - name: Install Rust 1.95.0
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal \
+            --component clippy --component rustfmt --component rust-src
+          rustup default 1.95.0
+          rustup target add aarch64-apple-darwin --toolchain 1.95.0
+          rustc --version
+          cargo --version
+
+      - name: Download sandbox-enabled V8 prebuilt
+        run: |
+          mkdir -p "$RUNNER_TEMP/v8"
+          base="https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0"
+          curl -fL --retry 5 --retry-delay 3 \
+            -o "$RUSTY_V8_ARCHIVE" \
+            "$base/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz"
+          curl -fL --retry 5 --retry-delay 3 \
+            -o "$RUSTY_V8_SRC_BINDING_PATH" \
+            "$base/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs"
+          echo "$RUSTY_V8_ARCHIVE_SHA256  $RUSTY_V8_ARCHIVE" | shasum -a 256 -c -
+          ls -lh "$RUNNER_TEMP/v8"
+
+      - name: Build codex
+        working-directory: codex-rs
+        env:
+          STABLE_GIT_COMMIT: ${{ github.sha }}
+        run: |
+          cargo build --release --target aarch64-apple-darwin \
+            --bin codex \
+            --bin codex-code-mode-host
+          df -h /
+
+      - name: Ad-hoc sign binaries
+        run: |
+          cd codex-rs/target/aarch64-apple-darwin/release
+          for b in codex codex-code-mode-host; do
+            codesign --force --sign - "$b"
+            codesign --verify --verbose=2 "$b"
+          done
+          codesign -dv --verbose=4 codex 2>&1 | head -20
+
+      - name: Package
+        run: |
+          cd codex-rs/target/aarch64-apple-darwin/release
+          {
+            echo "commit=${{ github.sha }}"
+            rustc --version
+            cargo --version
+            sw_vers
+          } > BUILD_INFO.txt
+          tar -czf "$RUNNER_TEMP/codex-aarch64-apple-darwin.tar.gz" \
+            codex codex-code-mode-host BUILD_INFO.txt
+          shasum -a 256 "$RUNNER_TEMP/codex-aarch64-apple-darwin.tar.gz" | tee "$RUNNER_TEMP/SHA256SUMS"
+          ls -lh "$RUNNER_TEMP" codex codex-code-mode-host
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-aarch64-apple-darwin
+          path: |
+            ${{ runner.temp }}/codex-aarch64-apple-darwin.tar.gz
+            ${{ runner.temp }}/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

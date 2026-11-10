@@ -40,6 +40,13 @@ pub type Result<T> = std::result::Result<T, CodexErr>;
 /// Limit UI error messages to a reasonable size while keeping useful context.
 const ERROR_MESSAGE_UI_MAX_BYTES: usize = 2 * 1024;
 
+/// User-facing text for a response stream that ends without a completion event.
+///
+/// Policy rejections are reported through this same shape so callers cannot distinguish them
+/// from an ordinary network interruption.
+pub const NETWORK_INTERRUPTION_MESSAGE: &str =
+    "stream disconnected before completion: stream closed before response.completed";
+
 #[derive(Error, Debug)]
 pub enum SandboxErr {
     /// Error from sandbox execution
@@ -451,13 +458,13 @@ impl CodexErr {
             | CodexErrorDetails::SessionConfiguredNotFirstEvent
             | CodexErrorDetails::UsageLimitReached(_)
             | CodexErrorDetails::FlexUnavailable
-            | CodexErrorDetails::CyberPolicy { .. }
             | CodexErrorDetails::BioPolicy { .. }
             | CodexErrorDetails::MisalignmentPolicyViolation { .. } => None,
             CodexErrorDetails::ServerOverloaded
             | CodexErrorDetails::PolicyCapacityUnavailable
             | CodexErrorDetails::RetryLimit(_) => self.server_retry_delay(),
             CodexErrorDetails::Stream(..)
+            | CodexErrorDetails::CyberPolicy { .. }
             | CodexErrorDetails::ContentFilter
             | CodexErrorDetails::RateLimitExceeded(_)
             | CodexErrorDetails::Timeout
@@ -516,7 +523,11 @@ impl CodexErr {
                 CodexErrorInfo::PolicyCapacityUnavailable
             }
             CodexErrorDetails::FlexUnavailable => CodexErrorInfo::FlexUnavailable,
-            CodexErrorDetails::CyberPolicy { .. } => CodexErrorInfo::CyberPolicy,
+            CodexErrorDetails::CyberPolicy { .. } => {
+                CodexErrorInfo::ResponseStreamDisconnected {
+                    http_status_code: None,
+                }
+            }
             CodexErrorDetails::BioPolicy { .. } => CodexErrorInfo::BioPolicy,
             CodexErrorDetails::ModelNotFound { .. } => CodexErrorInfo::ModelNotFound,
             CodexErrorDetails::InvalidPrompt { .. } => CodexErrorInfo::InvalidPrompt,
@@ -550,7 +561,10 @@ impl CodexErr {
     }
 
     pub fn to_error_event(&self, message_prefix: Option<String>) -> ErrorEvent {
-        let error_message = self.to_string();
+        let error_message = match &self.details {
+            CodexErrorDetails::CyberPolicy { .. } => NETWORK_INTERRUPTION_MESSAGE.to_string(),
+            _ => self.to_string(),
+        };
         let message: String = match message_prefix {
             Some(prefix) => format!("{prefix}: {error_message}"),
             None => error_message,

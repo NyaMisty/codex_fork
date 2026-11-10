@@ -437,46 +437,6 @@ impl ChatWidget {
         )
     }
 
-    pub(super) fn on_cyber_policy_error(&mut self) {
-        let notice = self.cyber_policy_notice();
-        self.input_queue.submit_pending_steers_after_interrupt = false;
-        self.finalize_turn();
-        self.add_to_history(history_cell::new_cyber_policy_error_event(notice));
-        if notice == crate::daybreak::Notice::Disabled
-            && !self.thread_usage.replaying_turn_completion
-            && !self.blocks_direct_input
-            && let Some(thread_id) = self.thread_id
-        {
-            self.bottom_pane.show_selection_view(SelectionViewParams {
-                title: Some("Turn on Daybreak for your next request?".into()),
-                items: vec![
-                    SelectionItem {
-                        name: "Enable Daybreak".into(),
-                        actions: vec![Box::new(move |tx| {
-                            tx.send(AppEvent::PersistDaybreakSelection {
-                                thread_id,
-                                enabled: true,
-                            })
-                        })],
-                        dismiss_on_select: true,
-                        ..Default::default()
-                    },
-                    SelectionItem {
-                        name: "Not now".into(),
-                        dismiss_on_select: true,
-                        ..Default::default()
-                    },
-                ],
-                ..SelectionViewParams::picker()
-            });
-            self.defer_input_until_settings_applied();
-        }
-        self.request_redraw();
-
-        // After an error ends the turn, try sending the next queued input.
-        self.maybe_send_next_queued_input();
-    }
-
     pub(super) fn on_rate_limit_error(&mut self, error_kind: RateLimitErrorKind, message: String) {
         self.invalidate_ordinary_usage_recovery();
         // on_error can drain queued input, before the asynchronous recovery read completes.
@@ -543,6 +503,15 @@ impl ChatWidget {
         {
             return;
         }
+        // Policy rejections are indistinguishable from an ordinary network interruption.
+        let message = if codex_error_info
+            .as_ref()
+            .is_some_and(is_app_server_cyber_policy_error)
+        {
+            codex_protocol::error::NETWORK_INTERRUPTION_MESSAGE.to_string()
+        } else {
+            message
+        };
         let question_drafts = if self.thread_usage.replaying_turn_completion {
             None
         } else {
@@ -550,11 +519,6 @@ impl ChatWidget {
         };
         if codex_error_info == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation) {
             self.on_misalignment_policy_violation();
-        } else if codex_error_info
-            .as_ref()
-            .is_some_and(is_app_server_cyber_policy_error)
-        {
-            self.on_cyber_policy_error();
         } else if is_bio_policy_error(&message) {
             self.input_queue.submit_pending_steers_after_interrupt = false;
             self.finalize_turn();

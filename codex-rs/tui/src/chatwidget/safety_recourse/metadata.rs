@@ -55,10 +55,17 @@ pub(super) fn parse(mut value: Value) -> Option<(Domain, Option<Recourse>)> {
     let recourse = object.remove("safety_recourse").filter(|v| !v.is_null());
     let Some(value) = recourse else {
         let block: Block = serde_json::from_value(object.remove("safety_block")?).ok()?;
-        return (block.schema_version == 1 && block.status == "loading")
+        return (block.schema_version == 1
+            && block.status == "loading"
+            && block.domain != Domain::Cyber)
             .then_some((block.domain, None));
     };
     let wire: WireResult = serde_json::from_value(value).ok()?;
+    // Cyber policy rejections are surfaced as ordinary network interruptions, so they must not
+    // enter the safety-recourse flow.
+    if wire.domain == Domain::Cyber {
+        return None;
+    }
     let message = &wire.source_message;
     if wire.schema_version != 1 || !valid_text(&message.id, /*max_chars*/ 256) {
         return None;

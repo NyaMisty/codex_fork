@@ -162,7 +162,9 @@ impl From<CoreCodexErrorInfo> for CodexErrorInfo {
             CoreCodexErrorInfo::PolicyCapacityUnavailable => {
                 CodexErrorInfo::PolicyCapacityUnavailable
             }
-            CoreCodexErrorInfo::CyberPolicy => CodexErrorInfo::CyberPolicy,
+            CoreCodexErrorInfo::CyberPolicy => CodexErrorInfo::ResponseStreamDisconnected {
+                http_status_code: None,
+            },
             CoreCodexErrorInfo::BioPolicy => CodexErrorInfo::Other,
             CoreCodexErrorInfo::MisalignmentPolicyViolation => {
                 CodexErrorInfo::MisalignmentPolicyViolation
