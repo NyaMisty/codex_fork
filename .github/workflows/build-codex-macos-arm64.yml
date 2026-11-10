@@ -30,10 +30,6 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
       CARGO_PROFILE_RELEASE_STRIP: "true"
       MACOSX_DEPLOYMENT_TARGET: "11.0"
-      # OpenAI publishes sandbox-enabled V8 archives that upstream rusty_v8 does not.
-      RUSTY_V8_ARCHIVE: ${{ runner.temp }}/v8/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz
-      RUSTY_V8_ARCHIVE_SHA256: "feab9ae0384bebaa99c1d000654462c9d42123d587185c7876aaeef7d76ff749"
-      RUSTY_V8_SRC_BINDING_PATH: ${{ runner.temp }}/v8/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs
 
     steps:
       - name: Checkout
@@ -63,21 +59,29 @@ jobs:
 
       - name: Download sandbox-enabled V8 prebuilt
         run: |
-          mkdir -p "$RUNNER_TEMP/v8"
+          v8_dir="$RUNNER_TEMP/v8"
+          mkdir -p "$v8_dir"
           base="https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0"
+          archive="$v8_dir/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz"
+          binding="$v8_dir/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs"
           curl -fL --retry 5 --retry-delay 3 \
-            -o "$RUSTY_V8_ARCHIVE" \
+            -o "$archive" \
             "$base/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz"
           curl -fL --retry 5 --retry-delay 3 \
-            -o "$RUSTY_V8_SRC_BINDING_PATH" \
+            -o "$binding" \
             "$base/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs"
-          echo "$RUSTY_V8_ARCHIVE_SHA256  $RUSTY_V8_ARCHIVE" | shasum -a 256 -c -
-          ls -lh "$RUNNER_TEMP/v8"
+          echo "feab9ae0384bebaa99c1d000654462c9d42123d587185c7876aaeef7d76ff749  $archive" | shasum -a 256 -c -
+          ls -lh "$v8_dir"
 
       - name: Build codex
         working-directory: codex-rs
         env:
           STABLE_GIT_COMMIT: ${{ github.sha }}
+          # OpenAI publishes sandbox-enabled V8 archives that upstream rusty_v8 does not.
+          # The runner context is only available in step-level env, not job-level env.
+          RUSTY_V8_ARCHIVE: ${{ runner.temp }}/v8/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz
+          RUSTY_V8_ARCHIVE_SHA256: "feab9ae0384bebaa99c1d000654462c9d42123d587185c7876aaeef7d76ff749"
+          RUSTY_V8_SRC_BINDING_PATH: ${{ runner.temp }}/v8/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs
         run: |
           cargo build --release --target aarch64-apple-darwin \
             --bin codex \
