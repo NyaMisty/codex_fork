@@ -57,44 +57,22 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Download sandbox-enabled V8 prebuilt
-        run: |
-          v8_dir="$RUNNER_TEMP/v8"
-          mkdir -p "$v8_dir"
-          base="https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0"
-          archive="$v8_dir/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz"
-          binding="$v8_dir/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs"
-          curl -fL --retry 5 --retry-delay 3 \
-            -o "$archive" \
-            "$base/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz"
-          curl -fL --retry 5 --retry-delay 3 \
-            -o "$binding" \
-            "$base/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs"
-          echo "feab9ae0384bebaa99c1d000654462c9d42123d587185c7876aaeef7d76ff749  $archive" | shasum -a 256 -c -
-          ls -lh "$v8_dir"
-
       - name: Build codex
         working-directory: codex-rs
         env:
           STABLE_GIT_COMMIT: ${{ github.sha }}
-          # OpenAI publishes sandbox-enabled V8 archives that upstream rusty_v8 does not.
-          # The runner context is only available in step-level env, not job-level env.
-          RUSTY_V8_ARCHIVE: ${{ runner.temp }}/v8/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz
-          RUSTY_V8_ARCHIVE_SHA256: "feab9ae0384bebaa99c1d000654462c9d42123d587185c7876aaeef7d76ff749"
-          RUSTY_V8_SRC_BINDING_PATH: ${{ runner.temp }}/v8/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs
         run: |
-          cargo build --release --target aarch64-apple-darwin \
-            --bin codex \
-            --bin codex-code-mode-host
+          # The codex binary talks to codex-code-mode over gRPC and does not link V8;
+          # only the separate codex-code-mode-host sidecar does, so this build stays
+          # within the standard runner's disk budget.
+          cargo build --release --target aarch64-apple-darwin --bin codex
           df -h /
 
-      - name: Ad-hoc sign binaries
+      - name: Ad-hoc sign binary
         run: |
           cd codex-rs/target/aarch64-apple-darwin/release
-          for b in codex codex-code-mode-host; do
-            codesign --force --sign - "$b"
-            codesign --verify --verbose=2 "$b"
-          done
+          codesign --force --sign - codex
+          codesign --verify --verbose=2 codex
           codesign -dv --verbose=4 codex 2>&1 | head -20
 
       - name: Package
@@ -107,9 +85,9 @@ jobs:
             sw_vers
           } > BUILD_INFO.txt
           tar -czf "$RUNNER_TEMP/codex-aarch64-apple-darwin.tar.gz" \
-            codex codex-code-mode-host BUILD_INFO.txt
+            codex BUILD_INFO.txt
           shasum -a 256 "$RUNNER_TEMP/codex-aarch64-apple-darwin.tar.gz" | tee "$RUNNER_TEMP/SHA256SUMS"
-          ls -lh "$RUNNER_TEMP" codex codex-code-mode-host
+          ls -lh "$RUNNER_TEMP" codex
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -523,11 +523,9 @@ impl CodexErr {
                 CodexErrorInfo::PolicyCapacityUnavailable
             }
             CodexErrorDetails::FlexUnavailable => CodexErrorInfo::FlexUnavailable,
-            CodexErrorDetails::CyberPolicy { .. } => {
-                CodexErrorInfo::ResponseStreamDisconnected {
-                    http_status_code: None,
-                }
-            }
+            CodexErrorDetails::CyberPolicy { .. } => CodexErrorInfo::ResponseStreamDisconnected {
+                http_status_code: None,
+            },
             CodexErrorDetails::BioPolicy { .. } => CodexErrorInfo::BioPolicy,
             CodexErrorDetails::ModelNotFound { .. } => CodexErrorInfo::ModelNotFound,
             CodexErrorDetails::InvalidPrompt { .. } => CodexErrorInfo::InvalidPrompt,
