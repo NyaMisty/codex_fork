@@ -1,0 +1,35 @@
+name: verify-codex-macos-arm64
+
+on:
+  push:
+    paths:
+      - ".github/workflows/verify-codex-macos-arm64.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify:
+    # Same free Apple Silicon runner class used for the build.
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Download built artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-aarch64-apple-darwin
+          run-id: 42916585058
+          github-token: ${{ github.token }}
+          path: artifact
+
+      - name: Verify signature and run
+        run: |
+          cd artifact
+          echo "45d59b15951fb36ef613dc7008748f950f11bc8c801c457b0b56d0e7960e5438  codex-aarch64-apple-darwin.tar.gz" | shasum -a 256 -c -
+          tar xzf codex-aarch64-apple-darwin.tar.gz
+          file codex
+          codesign --verify --verbose=2 codex
+          ./codex --version
+          ./codex --help | sed -n '1,25p'
