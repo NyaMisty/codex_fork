@@ -1071,7 +1071,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                 outgoing
                     .send_server_notification(ServerNotification::Error(ErrorNotification {
                         error: turn_error,
-                        will_retry: false,
+                        // The session is going to continue this turn automatically. Clients
+                        // must treat the notice as transient rather than as a failed turn.
+                        will_retry: true,
                         thread_id: conversation_id.to_string(),
                         turn_id: event_turn_id.clone(),
                     }))
