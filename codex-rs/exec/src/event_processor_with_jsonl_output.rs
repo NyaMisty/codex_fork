@@ -447,6 +447,8 @@ impl EventProcessorWithJsonOutput {
                 warning.status
             }
             ServerNotification::Error(notification) => {
+                let auto_continue = notification.error.codex_error_info.as_ref()
+                    == Some(&codex_app_server_protocol::CodexErrorInfo::AutoContinue);
                 let message = match notification.error.additional_details {
                     Some(details) if !details.is_empty() => {
                         format!("{} ({details})", notification.error.message)
@@ -454,7 +456,11 @@ impl EventProcessorWithJsonOutput {
                     _ => notification.error.message,
                 };
                 let error = ThreadErrorEvent { message };
-                self.last_critical_error = Some(error.clone());
+                // Auto-continue notices are transient: surface the message, but do not retain
+                // it as the terminal error for this turn.
+                if !auto_continue {
+                    self.last_critical_error = Some(error.clone());
+                }
                 events.push(ThreadEvent::Error(error));
                 CodexStatus::Running
             }
