@@ -30,6 +30,9 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
       CARGO_PROFILE_RELEASE_STRIP: "true"
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # libgit2's transport is flaky for git dependencies with nested submodules;
+      # the project's own CI prefers the system git CLI for the same reason.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
     steps:
       - name: Checkout
