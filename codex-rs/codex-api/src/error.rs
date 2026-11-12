@@ -19,6 +19,10 @@ pub enum ApiError {
     Api { status: StatusCode, message: String },
     #[error("stream error: {0}")]
     Stream(String),
+    /// A stream interruption caused by an upstream policy rejection. Callers must treat it
+    /// exactly like [`ApiError::Stream`] while also arranging an automatic continuation.
+    #[error("stream error: {0}")]
+    StreamAutoContinue(String),
     #[error("stream error: Incomplete response returned, reason: content_filter")]
     ContentFilter,
     #[error(transparent)]

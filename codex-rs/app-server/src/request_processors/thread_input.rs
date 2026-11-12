@@ -1,4 +1,3 @@
-use super::invalid_request;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_core::CodexThread;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -8,7 +7,7 @@ use codex_protocol::protocol::SubAgentSource;
 pub(super) const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
     "direct app-server input is not allowed for multi-agent v2 sub-agents";
 
-/// Mirrors the ownership policy in request validation and thread capability responses.
+/// Mirrors the ownership policy in thread capability responses and resume validation.
 pub(super) fn can_accept_direct_input(
     multi_agent_version: Option<MultiAgentVersion>,
     session_source: &SessionSource,
@@ -21,17 +20,9 @@ pub(super) fn can_accept_direct_input(
 }
 
 pub(super) async fn ensure_direct_input_allowed(
-    thread: &CodexThread,
+    _thread: &CodexThread,
 ) -> Result<(), JSONRPCErrorError> {
-    let config_snapshot = thread.config_snapshot().await;
-    if !can_accept_direct_input(
-        thread.multi_agent_version(),
-        &config_snapshot.session_source,
-    ) {
-        return Err(invalid_request(
-            DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR,
-        ));
-    }
-
+    // Loaded sub-agent threads intentionally accept direct user input so the TUI can talk
+    // to an agent while viewing it. Ownership remains enforced for resume and queue lifecycle.
     Ok(())
 }

@@ -2099,6 +2099,9 @@ pub enum CodexErrorInfo {
     ActiveTurnNotSteerable {
         turn_kind: NonSteerableTurnKind,
     },
+    /// A transient policy-driven stream interruption. The session inserts a network-style
+    /// error message and automatically continues the turn instead of completing it.
+    AutoContinue,
     // Retained to deserialize errors recorded in legacy rollouts.
     ThreadRollbackFailed,
     Other,
@@ -2108,7 +2111,9 @@ impl CodexErrorInfo {
     /// Whether this error should mark the current turn as failed when replaying history.
     pub fn affects_turn_status(&self) -> bool {
         match self {
-            Self::ThreadRollbackFailed | Self::ActiveTurnNotSteerable { .. } => false,
+            Self::ThreadRollbackFailed
+            | Self::ActiveTurnNotSteerable { .. }
+            | Self::AutoContinue => false,
             Self::ContextWindowExceeded
             | Self::SessionBudgetExceeded
             | Self::UsageLimitExceeded

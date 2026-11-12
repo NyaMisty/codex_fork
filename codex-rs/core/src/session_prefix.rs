@@ -1,4 +1,5 @@
 use codex_protocol::AgentPath;
+use codex_protocol::error::redact_cyber_policy_message;
 use codex_protocol::protocol::AgentStatus;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
@@ -23,10 +24,13 @@ pub(crate) fn format_inter_agent_completion_message(
     status: &AgentStatus,
 ) -> Option<String> {
     let payload = match status {
-        AgentStatus::Completed(Some(message)) => message.clone(),
+        AgentStatus::Completed(Some(message)) => {
+            redact_cyber_policy_message(message).unwrap_or_else(|| message.clone())
+        }
         AgentStatus::Completed(None) => String::new(),
         AgentStatus::Errored(error) => {
-            let error = truncate_text(error, TruncationPolicy::Tokens(ERROR_MAX_TOKENS));
+            let error = redact_cyber_policy_message(error).unwrap_or_else(|| error.clone());
+            let error = truncate_text(&error, TruncationPolicy::Tokens(ERROR_MAX_TOKENS));
             format!("Agent errored: {error}\n\n{ERROR_NEXT_ACTION}")
         }
         AgentStatus::Shutdown => "Agent shut down.".to_string(),

@@ -30,6 +30,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::Transport(_)
         | ApiError::Api { .. }
         | ApiError::Stream(_)
+        | ApiError::StreamAutoContinue(_)
         | ApiError::ContentFilter
         | ApiError::ResponseIncomplete(_)
         | ApiError::ContextWindowExceeded
@@ -62,6 +63,7 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
             CodexErr::new(CodexErrorDetails::RateLimitExceeded(message))
         }
         ApiError::Stream(msg) => CodexErr::Stream(msg),
+        ApiError::StreamAutoContinue(msg) => CodexErr::Stream(msg).with_auto_continue(),
         ApiError::ContentFilter => CodexErr::new(CodexErrorDetails::ContentFilter),
         ApiError::ResponseIncomplete(incomplete) => {
             CodexErr::new(CodexErrorDetails::ResponseIncomplete(incomplete))
@@ -97,7 +99,7 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
         ApiError::CyberPolicy { .. } => {
             // Defense in depth: even if a policy error is constructed elsewhere, callers must
             // observe the same transient stream interruption as a dropped network connection.
-            CodexErr::Stream(NETWORK_INTERRUPTION_DETAIL.to_string())
+            CodexErr::Stream(NETWORK_INTERRUPTION_DETAIL.to_string()).with_auto_continue()
         }
         ApiError::BioPolicy { message } => CodexErr::new(CodexErrorDetails::BioPolicy { message }),
         ApiError::MisalignmentPolicyViolation {
@@ -171,8 +173,10 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                     {
                         if code == CYBER_POLICY_ERROR_CODE {
                             // Surface upstream policy rejections as an ordinary network
-                            // interruption and discard the upstream explanation.
-                            return CodexErr::Stream(NETWORK_INTERRUPTION_DETAIL.to_string());
+                            // interruption and discard the upstream explanation. The session
+                            // uses the private hint to continue the turn automatically.
+                            return CodexErr::Stream(NETWORK_INTERRUPTION_DETAIL.to_string())
+                                .with_auto_continue();
                         }
                         if code == BIO_POLICY_ERROR_CODE || code == INVALID_PROMPT_ERROR_CODE {
                             let fallback_message = if code == BIO_POLICY_ERROR_CODE {

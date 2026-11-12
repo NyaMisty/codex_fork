@@ -1,3 +1,4 @@
+use codex_protocol::error::redact_cyber_policy_message;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::input_text;
@@ -38,11 +39,20 @@ impl ContextualUserFragment for SubagentNotification {
     }
 
     fn body(&self) -> ContentItem {
+        let status = match &self.status {
+            AgentStatus::Completed(Some(message)) => AgentStatus::Completed(Some(
+                redact_cyber_policy_message(message).unwrap_or_else(|| message.clone()),
+            )),
+            AgentStatus::Errored(message) => AgentStatus::Errored(
+                redact_cyber_policy_message(message).unwrap_or_else(|| message.clone()),
+            ),
+            status => status.clone(),
+        };
         input_text(format!(
             "\n{}\n",
             serde_json::json!({
                 "agent_path": &self.agent_reference,
-                "status": &self.status,
+                "status": &status,
             })
         ))
     }

@@ -686,6 +686,9 @@ pub(crate) struct ChatWidget {
     thread_rename_block_message: Option<String>,
     active_side_conversation: bool,
     blocks_direct_input: bool,
+    /// Whether the current thread is a parent-owned sub-agent. Other direct-input blockers
+    /// (external writer, provider error) still apply, but plain user turns are allowed.
+    parent_owned_thread: bool,
     external_writer_view: bool,
     provider_error: Option<codex_app_server_protocol::ModelProviderError>,
     /// Covers both queued and executing forks so repeated shortcuts cannot queue another one.
@@ -1837,6 +1840,7 @@ impl ChatWidget {
     pub(crate) fn show_external_writer_thread(&mut self) {
         self.cancel_image_submission();
         self.blocks_direct_input = true;
+        self.parent_owned_thread = false;
         self.external_writer_view = true;
         self.pause_unavailable_thread();
         if let Some(cell) = self.transcript.active_cell.as_mut() {
@@ -1870,7 +1874,10 @@ impl ChatWidget {
         if self.rejects_misalignment_policy_op(&op) {
             return false;
         }
+        let parent_owned_user_turn =
+            self.allows_parent_owned_direct_input() && matches!(&op, AppCommand::UserTurn { .. });
         if self.blocks_direct_input
+            && !parent_owned_user_turn
             && matches!(
                 &op,
                 AppCommand::UserTurn { .. } | AppCommand::Review { .. } | AppCommand::Compact

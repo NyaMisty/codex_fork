@@ -132,6 +132,7 @@ impl ChatWidget {
     ) {
         self.provider_error = Some(error);
         self.blocks_direct_input = true;
+        self.parent_owned_thread = false;
         self.input_queue.suppress_queue_autosend = true;
         self.input_queue.recovered_queue = true;
         if let Some(client_id) = rejected_message_id {

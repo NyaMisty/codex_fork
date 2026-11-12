@@ -207,6 +207,7 @@ fn should_retry_guardian_review(outcome: &GuardianReviewOutcome) -> bool {
             | CodexErrorInfo::InvalidPrompt
             | CodexErrorInfo::SandboxError
             | CodexErrorInfo::ActiveTurnNotSteerable { .. }
+            | CodexErrorInfo::AutoContinue
             | CodexErrorInfo::ThreadRollbackFailed
             | CodexErrorInfo::Other => false,
         },

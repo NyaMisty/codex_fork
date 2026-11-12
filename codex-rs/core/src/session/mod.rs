@@ -240,6 +240,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::ResponseIncompleteError;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::error::redact_cyber_policy_message;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
 
@@ -2638,7 +2639,8 @@ impl Session {
         let mut error_info = None;
         let status = match turn_context.terminal_error.lock().await.take() {
             Some(error) => {
-                let status = AgentStatus::Errored(error.message);
+                let message = redact_cyber_policy_message(&error.message).unwrap_or(error.message);
+                let status = AgentStatus::Errored(message);
                 self.agent_status.send_replace(status.clone());
                 status
             }
@@ -2651,7 +2653,10 @@ impl Session {
                     // Report the safety stop to the parent without changing the child's
                     // interrupted status or notifying for ordinary interruptions.
                     error_info = error.codex_error_info.clone();
-                    AgentStatus::Errored(error.message.clone())
+                    AgentStatus::Errored(
+                        redact_cyber_policy_message(&error.message)
+                            .unwrap_or_else(|| error.message.clone()),
+                    )
                 } else {
                     let Some(status) = agent_status_from_event(msg) else {
                         return;

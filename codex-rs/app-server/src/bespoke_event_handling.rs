@@ -1056,6 +1056,29 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::Error(ev) => {
+            if matches!(
+                &ev.codex_error_info,
+                Some(codex_protocol::protocol::CodexErrorInfo::AutoContinue)
+            ) {
+                // Non-terminal auto-continue notice: forward it so clients can insert the
+                // network-style message, but do not mark the thread or turn as failed.
+                let turn_error = TurnError {
+                    misalignment: ev.misalignment.map(Into::into),
+                    message: ev.message,
+                    codex_error_info: ev.codex_error_info.map(V2CodexErrorInfo::from),
+                    additional_details: None,
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::Error(ErrorNotification {
+                        error: turn_error,
+                        will_retry: false,
+                        thread_id: conversation_id.to_string(),
+                        turn_id: event_turn_id.clone(),
+                    }))
+                    .await;
+                return;
+            }
+
             thread_watch_manager
                 .note_system_error(&conversation_id.to_string())
                 .await;

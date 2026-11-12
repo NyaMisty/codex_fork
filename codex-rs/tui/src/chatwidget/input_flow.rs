@@ -15,7 +15,14 @@ impl ChatWidget {
     pub(crate) fn set_parent_owned_thread(&mut self) {
         self.cancel_image_submission();
         self.blocks_direct_input = true;
+        self.parent_owned_thread = true;
         self.bottom_pane.set_parent_owned_thread();
+    }
+
+    /// Direct chat input is allowed for a parent-owned sub-agent unless another UI state
+    /// (external writer or provider error) still blocks input.
+    pub(crate) fn allows_parent_owned_direct_input(&self) -> bool {
+        self.parent_owned_thread && !self.external_writer_view && self.provider_error.is_none()
     }
 
     pub(super) fn handle_composer_input_result(
@@ -253,7 +260,7 @@ impl ChatWidget {
         {
             return false;
         }
-        if self.blocks_direct_input {
+        if self.blocks_direct_input && !self.allows_parent_owned_direct_input() {
             return false;
         }
         if self.is_user_turn_pending_or_running() {
@@ -387,7 +394,7 @@ impl ChatWidget {
         text: String,
         mut collaboration_mode: CollaborationModeMask,
     ) {
-        if self.blocks_direct_input {
+        if self.blocks_direct_input && !self.allows_parent_owned_direct_input() {
             self.add_error_message(if self.external_writer_view {
                 "This thread is open elsewhere. Close it there and retry resume to continue."
                     .to_string()

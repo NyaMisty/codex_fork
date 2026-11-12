@@ -212,7 +212,14 @@ impl ChatWidget {
                 self.on_hook_completed(notification.run);
             }
             ServerNotification::Error(notification) => {
-                if notification.will_retry {
+                if notification.error.codex_error_info
+                    == Some(AppServerCodexErrorInfo::AutoContinue)
+                {
+                    self.handle_non_retry_error(
+                        notification.error.message,
+                        notification.error.codex_error_info,
+                    );
+                } else if notification.will_retry {
                     if !from_replay {
                         self.on_stream_error(
                             notification.error.message,

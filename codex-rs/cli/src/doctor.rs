@@ -2461,7 +2461,9 @@ fn websocket_error_detail(err: &ApiError) -> String {
             format!("handshake transport error: {detail}")
         }
         ApiError::Api { status, .. } => format!("handshake API error: {status} [redacted]"),
-        ApiError::Stream(_) => "handshake stream error: [redacted]".to_string(),
+        ApiError::Stream(_) | ApiError::StreamAutoContinue(_) => {
+            "handshake stream error: [redacted]".to_string()
+        }
         ApiError::ResponseIncomplete(_) => {
             "handshake error: incomplete response: [redacted]".to_string()
         }

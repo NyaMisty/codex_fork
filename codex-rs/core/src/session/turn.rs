@@ -41,6 +41,7 @@ use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
+use crate::session::UserInputMetadata;
 use crate::session::daemon_recovery::RecordedTurnInput;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -160,6 +161,9 @@ pub(crate) struct McpStartupRequirements {
     required_servers: Vec<String>,
     required_plugins: HashSet<String>,
 }
+
+/// Automatically sent when an upstream cyber-policy interruption is surfaced as a network error.
+const AUTO_CONTINUE_PROMPT: &str = "继续";
 
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
@@ -916,6 +920,24 @@ pub(crate) async fn run_turn(
                 sess.send_event(&turn_context, event).await;
                 break;
             }
+            Err(err) if err.should_auto_continue() => {
+                // Surface the interruption as an ordinary network error, then keep the same
+                // turn alive and feed "继续" to the model. The app-server forwards this
+                // non-terminal error so clients can insert the message without completing
+                // the turn or notifying a parent agent.
+                sess.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::Error(ErrorEvent {
+                        message: codex_protocol::error::NETWORK_INTERRUPTION_MESSAGE.to_string(),
+                        codex_error_info: Some(CodexErrorInfo::AutoContinue),
+                        misalignment: None,
+                    }),
+                )
+                .await;
+                enqueue_auto_continue_input(sess.as_ref()).await;
+                can_drain_pending_input = true;
+                continue;
+            }
             Err(e) => {
                 info!("Turn error: {e:#}");
                 if matches!(
@@ -937,6 +959,31 @@ pub(crate) async fn run_turn(
     }
 
     Ok(last_agent_message)
+}
+
+/// Queues the automatic continuation input for the currently active turn.
+async fn enqueue_auto_continue_input(sess: &Session) {
+    let turn_state = {
+        let active = sess.active_turn.lock().await;
+        active
+            .as_ref()
+            .map(|active_turn| Arc::clone(&active_turn.turn_state))
+    };
+    if let Some(turn_state) = turn_state {
+        sess.input_queue
+            .extend_pending_input_for_turn_state(
+                turn_state.as_ref(),
+                vec![TurnInput::UserInput {
+                    content: vec![UserInput::Text {
+                        text: AUTO_CONTINUE_PROMPT.to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    client_id: None,
+                    metadata: UserInputMetadata::default(),
+                }],
+            )
+            .await;
+    }
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1914,6 +1961,12 @@ async fn run_sampling_request(
                 _ => err,
             },
         };
+
+        if err.should_auto_continue() {
+            // Do not spend the ordinary network retry budget on a policy interruption that
+            // the turn loop is going to recover from immediately.
+            return Err(err);
+        }
 
         let retry = handle_response_stream_error(
             &mut retry_state,
@@ -2984,7 +3037,10 @@ async fn try_run_sampling_request(
                     .await;
                     should_emit_token_count |= incomplete.token_usage.is_some();
                 }
-                if *draining_for_mailbox && matches!(err.details(), CodexErrorDetails::Stream(_)) {
+                if *draining_for_mailbox
+                    && matches!(err.details(), CodexErrorDetails::Stream(_))
+                    && !err.should_auto_continue()
+                {
                     // Mail already requires a follow-up, even if the producer exited before
                     // receiving the interrupt. Do not retry without that pending input.
                     break Ok(SamplingRequestResult {

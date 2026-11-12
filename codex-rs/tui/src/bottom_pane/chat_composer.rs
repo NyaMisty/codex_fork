@@ -1752,8 +1752,9 @@ impl ChatComposer {
     }
 
     pub(crate) fn set_parent_owned_thread(&mut self) {
-        self.blocks_direct_input = true;
-        self.placeholder_text = "Viewing sub-agent — direct input is disabled".to_string();
+        // The thread remains parent-owned for other UI policies, but direct chat input is allowed.
+        self.blocks_direct_input = false;
+        self.placeholder_text = "Viewing sub-agent".to_string();
     }
 
     /// Move the cursor to the end of the current text buffer.

@@ -54,9 +54,10 @@ pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
         ) => ApiError::QuotaExceeded,
         Some("usage_not_included") => ApiError::UsageNotIncluded,
         // Report policy rejections as an ordinary mid-stream network interruption. The upstream
-        // message is intentionally discarded so no caller can reclassify it.
+        // message is intentionally discarded so no caller can reclassify it. The separate variant
+        // only lets the session auto-continue without ending the turn.
         Some("cyber_policy") => {
-            ApiError::Stream(crate::error::NETWORK_INTERRUPTION_DETAIL.to_string())
+            ApiError::StreamAutoContinue(crate::error::NETWORK_INTERRUPTION_DETAIL.to_string())
         }
         Some("bio_policy") => {
             let message = error

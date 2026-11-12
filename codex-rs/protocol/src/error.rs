@@ -47,6 +47,25 @@ const ERROR_MESSAGE_UI_MAX_BYTES: usize = 2 * 1024;
 pub const NETWORK_INTERRUPTION_MESSAGE: &str =
     "stream disconnected before completion: stream closed before response.completed";
 
+/// Returns the network-interruption text when `message` carries a provider cyber-policy notice.
+///
+/// Used at notification and status boundaries so a policy rejection can never leak policy text
+/// to a parent agent, including through sub-agent completion messages.
+pub fn redact_cyber_policy_message(message: &str) -> Option<String> {
+    const MARKERS: &[&str] = &[
+        "cyber_policy",
+        "cyber policy:",
+        "flagged for cyber policy",
+        "flagged for possible cybersecurity risk",
+        "flagged for potentially high-risk cyber activity",
+    ];
+    let lower = message.to_ascii_lowercase();
+    MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+        .then(|| NETWORK_INTERRUPTION_MESSAGE.to_string())
+}
+
 #[derive(Error, Debug)]
 pub enum SandboxErr {
     /// Error from sandbox execution
@@ -86,6 +105,8 @@ pub struct CodexErr {
     details: CodexErrorDetails,
     retry_after: Option<RetryAfter>,
     agent_context: Option<AgentErrorContext>,
+    /// Internal hint: the session should insert a network-style error and continue the turn.
+    auto_continue: bool,
 }
 
 /// A terminal response that stopped before the model finished, with any reported usage.
@@ -282,6 +303,7 @@ impl From<CodexErrorDetails> for CodexErr {
             details,
             retry_after: None,
             agent_context: None,
+            auto_continue: false,
         }
     }
 }
@@ -347,6 +369,7 @@ macro_rules! codex_err_unit_constructors {
                 details: CodexErrorDetails::$variant,
                 retry_after: None,
                 agent_context: None,
+                auto_continue: false,
             };
         )*
     };
@@ -419,6 +442,17 @@ impl CodexErr {
     /// Creates an error with no server-provided retry delay.
     pub fn new(details: CodexErrorDetails) -> Self {
         details.into()
+    }
+
+    /// Marks this error as a policy-triggered stream interruption that should not end the turn.
+    pub fn with_auto_continue(mut self) -> Self {
+        self.auto_continue = true;
+        self
+    }
+
+    /// Returns whether the session should auto-continue after surfacing this interruption.
+    pub fn should_auto_continue(&self) -> bool {
+        self.auto_continue
     }
 
     /// Returns the semantic failure and its diagnostic payload.

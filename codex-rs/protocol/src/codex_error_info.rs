@@ -50,6 +50,7 @@ enum CodexErrorInfoWire {
     ActiveTurnNotSteerable {
         turn_kind: NonSteerableTurnKind,
     },
+    AutoContinue,
     ThreadRollbackFailed,
     #[serde(other)]
     Other,

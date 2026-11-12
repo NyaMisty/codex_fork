@@ -497,6 +497,13 @@ impl ChatWidget {
         message: String,
         codex_error_info: Option<AppServerCodexErrorInfo>,
     ) {
+        if codex_error_info == Some(AppServerCodexErrorInfo::AutoContinue) {
+            // Core keeps the turn alive and will automatically send "继续"; insert the
+            // network-style error notice without finalizing the turn.
+            self.add_to_history(history_cell::new_error_event(message));
+            self.request_redraw();
+            return;
+        }
         if codex_error_info
             .as_ref()
             .is_some_and(|info| self.handle_app_server_steer_rejected_error(info))
