@@ -20,7 +20,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: codex-aarch64-apple-darwin
-          run-id: 43895387723
+          run-id: 43909888083
           github-token: ${{ github.token }}
           path: artifact
 
@@ -220,16 +220,16 @@ jobs:
                       ),
                       "body": body,
                   }
-                  if request_count <= 2:
+                  if request_count <= 3:
                       record["response"] = "cyber"
-                  elif request_count == 3:
+                  elif request_count == 4:
                       record["response"] = "tool_call"
                   else:
                       record["response"] = "completed"
                   with open(log_path, "a", encoding="utf-8") as log:
                       log.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-                  if request_count <= 2:
+                  if request_count <= 3:
                       payload = json.dumps({
                           "error": {
                               "message": "CYBER_TEST_MARKER_9137",
@@ -244,7 +244,7 @@ jobs:
                       self.wfile.write(payload)
                       return
 
-                  if request_count == 3:
+                  if request_count == 4:
                       payload = sse([
                           {"type": "response.created", "response": {"id": "resp-tool"}},
                           {
@@ -322,28 +322,28 @@ jobs:
               for line in open(sys.argv[1], encoding="utf-8")
               if line.strip()
           ]
-          assert len(records) >= 4, f"expected at least 4 requests, got {len(records)}"
+          assert len(records) >= 5, f"expected at least 5 requests, got {len(records)}"
 
           initial = records[0]
           assert "hello" in initial["body"], "first request did not contain the prompt"
           assert initial["model"] == "gpt-6.1-sol", initial
           assert initial["response"] == "cyber", initial
 
-          second_failure = records[1]
-          assert second_failure["model"] == "gpt-6.1-sol", second_failure
-          assert second_failure["has_continue"], second_failure
-          assert second_failure["response"] == "cyber", second_failure
+          for record in records[1:3]:
+              assert record["model"] == "gpt-6.1-sol", record
+              assert record["has_continue"], record
+              assert record["response"] == "cyber", record
 
-          fallback = records[2]
+          fallback = records[3]
           assert fallback["model"] == "gpt-6.1-terra", fallback
           assert fallback["effort"] == "high", fallback
           assert fallback["has_continue"], fallback
           assert fallback["response"] == "tool_call", fallback
 
-          restored = records[3]
+          restored = records[4]
           assert restored["model"] == "gpt-6.1-sol", restored
           assert restored["has_tool_output"], restored
           assert restored["response"] == "completed", restored
-          print("PASS: switched after consecutive failures and restored the original model on success")
+          print("PASS: switched after 2 consecutive 继续 attempts and restored the original model on success")
           PY
           kill "$(cat "$RUNNER_TEMP/fallback.pid")" || true
