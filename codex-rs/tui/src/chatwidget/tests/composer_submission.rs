@@ -239,7 +239,7 @@ async fn hidden_shell_paste_queued_before_session_submits_literal_prompt() {
 }
 
 #[tokio::test]
-async fn parent_owned_thread_blocks_all_direct_input_entry_points() {
+async fn parent_owned_thread_allows_user_input_and_compact() {
     let (mut chat, mut rx, mut op_rx) =
         make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
     chat.thread_id = Some(ThreadId::new());
@@ -249,31 +249,27 @@ async fn parent_owned_thread_blocks_all_direct_input_entry_points() {
     chat.set_side_conversation_active(/*active*/ false);
     chat.bottom_pane
         .set_composer_text("keep this draft".to_string(), Vec::new(), Vec::new());
-    let before = chat.bottom_pane.composer_draft_snapshot();
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    let mut after = chat.bottom_pane.composer_draft_snapshot();
-    after.last_composer_activity_at = before.last_composer_activity_at;
-    assert_eq!(after, before);
-    assert_no_submit_op(&mut op_rx);
-    let rendered = drain_insert_history(&mut rx)
-        .into_iter()
-        .flatten()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_chatwidget_snapshot!("parent_owned_thread_rejects_input", rendered);
+    let Op::UserTurn { items, .. } = next_submit_op(&mut op_rx) else {
+        panic!("expected submitted user turn");
+    };
+    assert_eq!(
+        items,
+        vec![UserInput::Text {
+            text: "keep this draft".into(),
+            text_elements: Vec::new(),
+        }]
+    );
 
-    let collaboration_mode_before = chat.active_collaboration_mask.clone();
     let plan_mode = collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Plan)
         .expect("expected plan collaboration mode");
     chat.submit_user_message_with_mode("Implement the plan.".to_string(), plan_mode);
-    assert_eq!(chat.active_collaboration_mask, collaboration_mode_before);
-    assert_no_submit_op(&mut op_rx);
+    assert!(matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. }));
 
+    // Other parent-owned command flows remain blocked.
     for command in [
-        "/init",
         "/review check this",
         "/side inspect this",
         "/archive",
@@ -285,16 +281,17 @@ async fn parent_owned_thread_blocks_all_direct_input_entry_points() {
     ] {
         chat.bottom_pane
             .set_composer_text(command.to_string(), Vec::new(), Vec::new());
-        let before = chat.bottom_pane.composer_draft_snapshot();
         chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let mut after = chat.bottom_pane.composer_draft_snapshot();
-        after.last_composer_activity_at = before.last_composer_activity_at;
-        assert_eq!(after, before);
         assert_no_submit_op(&mut op_rx);
     }
 
-    assert!(!chat.submit_op(AppCommand::compact()));
-    assert_no_submit_op(&mut op_rx);
+    // /compact is allowed from a parent-owned subagent thread.
+    while rx.try_recv().is_ok() {}
+    chat.dispatch_command(SlashCommand::Compact);
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::CodexOp(Op::Compact)))
+    );
 }
 
 #[tokio::test]

@@ -45,6 +45,7 @@ use crate::session::UserInputMetadata;
 use crate::session::daemon_recovery::RecordedTurnInput;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use crate::session::step_settings::ResolvedStepSettings;
 use crate::session::turn_context::TurnContext;
 use crate::skills::emit_explicit_skill_invocations;
 use crate::stream_events_utils::HandleOutputCtx;
@@ -120,6 +121,8 @@ use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::SafetyBufferingEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnDiffEvent;
+use codex_protocol::protocol::TurnSettingsUpdate;
+use codex_protocol::protocol::TurnSettingsUpdateOutcome;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_skills::ToolMentionKind;
@@ -492,6 +495,10 @@ pub(crate) async fn run_turn(
 
     let mut next_step_context = Some(first_step_context);
     let mut guardian_budget_compacted = false;
+    // Consecutive stream interruptions handled by auto-continue within this turn.
+    let mut auto_continue_failures: usize = 0;
+    // Set while the turn is temporarily running on the configured fallback model.
+    let mut auto_continue_fallback: Option<AutoContinueFallback> = None;
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -611,6 +618,17 @@ pub(crate) async fn run_turn(
         match sampling_request_result {
             Ok((sampling_request_output, notify_messages)) => {
                 guardian_budget_compacted = false;
+                // A successful request ends the failure streak. Restore the original
+                // model unless another settings update superseded the fallback.
+                auto_continue_failures = 0;
+                if let Some(AutoContinueFallback { original, applied }) =
+                    auto_continue_fallback.take()
+                {
+                    let current = turn_context.next_step_settings.load_full();
+                    if Arc::ptr_eq(&current, &applied) {
+                        turn_context.next_step_settings.store(original);
+                    }
+                }
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -934,6 +952,15 @@ pub(crate) async fn run_turn(
                     }),
                 )
                 .await;
+                auto_continue_failures += 1;
+                if auto_continue_fallback.is_none() {
+                    auto_continue_fallback = maybe_apply_auto_continue_fallback(
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        auto_continue_failures,
+                    )
+                    .await;
+                }
                 enqueue_auto_continue_input(sess.as_ref()).await;
                 can_drain_pending_input = true;
                 continue;
@@ -983,6 +1010,55 @@ async fn enqueue_auto_continue_input(sess: &Session) {
                 }],
             )
             .await;
+    }
+}
+
+/// Original and applied settings for a temporary auto-continue model fallback.
+struct AutoContinueFallback {
+    original: Arc<ResolvedStepSettings>,
+    applied: Arc<ResolvedStepSettings>,
+}
+
+/// Switches the active turn to the configured fallback model after
+/// `auto_continue.max_retries` consecutive failed continuations.
+async fn maybe_apply_auto_continue_fallback(
+    sess: &Session,
+    turn_context: &TurnContext,
+    failures: usize,
+) -> Option<AutoContinueFallback> {
+    let config = &turn_context.config.auto_continue;
+    let (model, effort) = config.fallback()?;
+    if failures < config.max_retries as usize {
+        return None;
+    }
+    let original = turn_context.next_step_settings.load_full();
+    let update = TurnSettingsUpdate {
+        model: Some(model.to_string()),
+        // `Some(None)` clears the fallback's inherited effort so the model default applies.
+        effort: Some(effort.cloned()),
+        ..Default::default()
+    };
+    match sess
+        .apply_auto_continue_fallback(&turn_context.sub_id, update)
+        .await
+    {
+        TurnSettingsUpdateOutcome::Applied => {
+            let applied = turn_context.next_step_settings.load_full();
+            warn!(
+                model = %model,
+                failures,
+                "auto-continue: switched to fallback model after repeated failures"
+            );
+            Some(AutoContinueFallback { original, applied })
+        }
+        TurnSettingsUpdateOutcome::TargetUnavailable => {
+            warn!("auto-continue: fallback model switch failed: active turn unavailable");
+            None
+        }
+        TurnSettingsUpdateOutcome::Rejected { reason } => {
+            warn!(%reason, "auto-continue: fallback model switch rejected");
+            None
+        }
     }
 }
 

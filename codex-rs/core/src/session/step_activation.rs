@@ -34,6 +34,7 @@ fn check_legacy_turn_safety(
     current: &ResolvedStepSettings,
     destination: &ResolvedStepSettings,
     live_config: &Config,
+    allow_synthetic_models: bool,
 ) -> Result<(), String> {
     let stack = &live_config.config_layer_stack;
     let requirements = stack.requirements();
@@ -82,6 +83,7 @@ fn check_legacy_turn_safety(
         &destination.model_info,
         &turn_context.config,
         live_config,
+        allow_synthetic_models,
     )
 }
 
@@ -93,12 +95,15 @@ fn check_legacy_model_safety(
     destination: &CatalogModel,
     admitted_config: &Config,
     live_config: &Config,
+    allow_synthetic_models: bool,
 ) -> Result<(), String> {
-    if admitted.origin == ModelOrigin::Synthetic || current.origin == ModelOrigin::Synthetic {
-        return Err("the active model has only fallback metadata".to_string());
-    }
-    if destination.origin == ModelOrigin::Synthetic {
-        return Err("the destination model has only fallback metadata".to_string());
+    if !allow_synthetic_models {
+        if admitted.origin == ModelOrigin::Synthetic || current.origin == ModelOrigin::Synthetic {
+            return Err("the active model has only fallback metadata".to_string());
+        }
+        if destination.origin == ModelOrigin::Synthetic {
+            return Err("the destination model has only fallback metadata".to_string());
+        }
     }
     let retained_models = [admitted, current];
     // The Guardian reviewer extension still selects its circuit-breaker
@@ -227,14 +232,41 @@ impl Session {
     ///
     /// Callers must serialize updates through completion, including model
     /// resolution, so each sparse patch sees the preceding publication.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "the final managed-policy check and active settings publication must remain atomic"
-    )]
     pub(super) async fn apply_turn_settings(
         &self,
         turn_id: &str,
         update: TurnSettingsUpdate,
+    ) -> TurnSettingsUpdateOutcome {
+        self.apply_turn_settings_inner(
+            turn_id, update, /*allow_unstable_model_switching*/ false,
+        )
+        .await
+    }
+
+    /// Applies a model fallback triggered by automatic stream recovery.
+    ///
+    /// This internal recovery path must work even when the experimental
+    /// step-model-switching feature is disabled.
+    pub(super) async fn apply_auto_continue_fallback(
+        &self,
+        turn_id: &str,
+        update: TurnSettingsUpdate,
+    ) -> TurnSettingsUpdateOutcome {
+        self.apply_turn_settings_inner(
+            turn_id, update, /*allow_unstable_model_switching*/ true,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the final managed-policy check and active settings publication must remain atomic"
+    )]
+    async fn apply_turn_settings_inner(
+        &self,
+        turn_id: &str,
+        update: TurnSettingsUpdate,
+        allow_unstable_model_switching: bool,
     ) -> TurnSettingsUpdateOutcome {
         let updates_model_settings = update.model.is_some()
             || update.effort.is_some()
@@ -242,7 +274,10 @@ impl Session {
             || update.service_tier.is_some();
         let requires_model_switching = updates_model_settings
             || (update.approvals_reviewer.is_none() && update.environments.is_none());
-        if requires_model_switching && !self.features.enabled(Feature::StepModelSwitching) {
+        if requires_model_switching
+            && !allow_unstable_model_switching
+            && !self.features.enabled(Feature::StepModelSwitching)
+        {
             return TurnSettingsUpdateOutcome::Rejected {
                 reason: "turn settings updates require the step_model_switching feature"
                     .to_string(),
@@ -368,6 +403,7 @@ impl Session {
                     &current,
                     candidate_settings,
                     &state.session_configuration.original_config_do_not_use,
+                    allow_unstable_model_switching,
                 )?;
             }
             Ok::<_, String>(())

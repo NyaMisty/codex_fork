@@ -622,6 +622,52 @@ pub enum ThreadStoreConfig {
     InMemory { id: String },
 }
 
+/// Automatic model fallback after repeated stream interruptions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoContinueConfig {
+    /// Number of consecutive failed automatic continuations allowed on the
+    /// current model before switching to the fallback model.
+    pub max_retries: u32,
+    /// Model to switch to after `max_retries` consecutive failures. Unset
+    /// disables the fallback.
+    pub fallback_model: Option<String>,
+    /// Reasoning effort to use with `fallback_model`. Unset uses the fallback
+    /// model's default effort.
+    pub fallback_reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl Default for AutoContinueConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            fallback_model: None,
+            fallback_reasoning_effort: None,
+        }
+    }
+}
+
+impl AutoContinueConfig {
+    fn from_toml(config: Option<codex_config::config_toml::AutoContinueToml>) -> Self {
+        let Some(config) = config else {
+            return Self::default();
+        };
+        Self {
+            max_retries: config.max_retries.unwrap_or(3),
+            fallback_model: config
+                .fallback_model
+                .filter(|model| !model.trim().is_empty()),
+            fallback_reasoning_effort: config.fallback_reasoning_effort,
+        }
+    }
+
+    /// Returns the configured fallback model and optional reasoning effort.
+    pub(crate) fn fallback(&self) -> Option<(&str, Option<&ReasoningEffort>)> {
+        self.fallback_model
+            .as_deref()
+            .map(|model| (model, self.fallback_reasoning_effort.as_ref()))
+    }
+}
+
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -1050,6 +1096,8 @@ pub struct Config {
     /// Value to use for `reasoning.effort` when making a request using the
     /// Responses API.
     pub model_reasoning_effort: Option<ReasoningEffort>,
+    /// Automatic recovery settings after repeated stream interruptions.
+    pub auto_continue: AutoContinueConfig,
     /// Optional Plan-mode-specific reasoning effort override used by the TUI.
     ///
     /// When unset, Plan mode uses the built-in Plan preset default (currently
@@ -4681,6 +4729,7 @@ impl Config {
                 .and_then(|auto_review| auto_review.circuit_break_action)
                 .unwrap_or_default(),
             model_reasoning_effort: cfg.model_reasoning_effort,
+            auto_continue: AutoContinueConfig::from_toml(cfg.auto_continue),
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_catalog,

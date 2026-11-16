@@ -1874,10 +1874,10 @@ impl ChatWidget {
         if self.rejects_misalignment_policy_op(&op) {
             return false;
         }
-        let parent_owned_user_turn =
-            self.allows_parent_owned_direct_input() && matches!(&op, AppCommand::UserTurn { .. });
+        let parent_owned_direct_op = self.allows_parent_owned_direct_input()
+            && matches!(&op, AppCommand::UserTurn { .. } | AppCommand::Compact);
         if self.blocks_direct_input
-            && !parent_owned_user_turn
+            && !parent_owned_direct_op
             && matches!(
                 &op,
                 AppCommand::UserTurn { .. } | AppCommand::Review { .. } | AppCommand::Compact

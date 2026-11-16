@@ -2002,7 +2002,7 @@ async fn live_app_server_server_overloaded_error_renders_error() {
 }
 
 #[tokio::test]
-async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
+async fn live_app_server_cyber_policy_error_renders_as_network_interruption() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.handle_server_notification(
@@ -2042,8 +2042,9 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1);
     let rendered = lines_to_single_string(&cells[0]);
-    assert!(rendered.contains("This content can’t be shown"));
-    assert!(rendered.contains("We take extra care with some cybersecurity requests"));
+    assert!(rendered.contains("stream disconnected before completion"));
+    assert!(!rendered.contains("This content can’t be shown"));
+    assert!(!rendered.contains("We take extra care with some cybersecurity requests"));
     assert!(!rendered.contains("server fallback message"));
     assert!(!chat.bottom_pane.is_task_running());
 }

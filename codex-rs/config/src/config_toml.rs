@@ -205,6 +205,10 @@ pub struct ConfigToml {
     #[serde(default)]
     pub auto_review: Option<AutoReviewToml>,
 
+    /// Automatic recovery behavior after repeated stream interruptions.
+    #[serde(default)]
+    pub auto_continue: Option<AutoContinueToml>,
+
     pub browser_use: Option<BrowserUseConfigToml>,
 
     pub computer_use: Option<ComputerUseConfigToml>,
@@ -577,6 +581,21 @@ pub enum ThreadStoreToml {
     InMemory {
         id: String,
     },
+}
+
+/// Automatic model fallback after repeated stream interruptions.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AutoContinueToml {
+    /// Number of consecutive failed automatic continuations allowed on the
+    /// current model before switching to the fallback model. Defaults to 3.
+    pub max_retries: Option<u32>,
+    /// Model to switch to after `max_retries` consecutive failures. Unset
+    /// disables the fallback.
+    pub fallback_model: Option<String>,
+    /// Reasoning effort to use with `fallback_model`. Unset uses the fallback
+    /// model's default effort.
+    pub fallback_reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
