@@ -587,7 +587,7 @@ pub enum ThreadStoreToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AutoContinueToml {
-    /// Number of consecutive failed automatic continuations allowed on the
+    /// Number of consecutive automatic continuations (`继续`) attempted on the
     /// current model before switching to the fallback model. Defaults to 3.
     pub max_retries: Option<u32>,
     /// Model to switch to after `max_retries` consecutive failures. Unset

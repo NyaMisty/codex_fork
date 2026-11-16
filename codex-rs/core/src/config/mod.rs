@@ -625,7 +625,7 @@ pub enum ThreadStoreConfig {
 /// Automatic model fallback after repeated stream interruptions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutoContinueConfig {
-    /// Number of consecutive failed automatic continuations allowed on the
+    /// Number of consecutive automatic continuations (`继续`) attempted on the
     /// current model before switching to the fallback model.
     pub max_retries: u32,
     /// Model to switch to after `max_retries` consecutive failures. Unset

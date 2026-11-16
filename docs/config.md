@@ -18,8 +18,8 @@ fallback_model = "gpt-6.1-terra"
 fallback_reasoning_effort = "high"
 ```
 
-- `max_retries`: number of consecutive automatic-continuation failures allowed
-  before switching. Defaults to 3.
+- `max_retries`: number of consecutive `继续` attempts allowed on the current
+  model before switching. Defaults to 3.
 - `fallback_model`: model used for the next attempt. Unset disables switching.
 - `fallback_reasoning_effort`: reasoning effort for the fallback model. Unset
   uses the fallback model's default effort.

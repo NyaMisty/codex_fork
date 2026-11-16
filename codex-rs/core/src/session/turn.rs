@@ -1028,7 +1028,10 @@ async fn maybe_apply_auto_continue_fallback(
 ) -> Option<AutoContinueFallback> {
     let config = &turn_context.config.auto_continue;
     let (model, effort) = config.fallback()?;
-    if failures < config.max_retries as usize {
+    // `failures` includes the response that started the streak. Allow
+    // `max_retries` automatic continuations on the current model before
+    // switching, so only switch after the (N+1)th consecutive failure.
+    if failures <= config.max_retries as usize {
         return None;
     }
     let original = turn_context.next_step_settings.load_full();
