@@ -70,11 +70,9 @@ jobs:
 
   build:
     needs: tag-check
-    # Manual fork runs build only the macOS arm64 primary bundle.
-    if: ${{ github.event_name != 'workflow_dispatch' || (matrix.target == 'aarch64-apple-darwin' && matrix.bundle == 'primary' && matrix.build-system == 'cargo') }}
-    name: Build - ${{ github.event_name == 'workflow_dispatch' && 'macos-15' || matrix.runner }} - ${{ matrix.target }} - ${{ matrix.bundle }} - ${{ matrix.build-system }}
+    name: Build - ${{ matrix.runner }} - ${{ matrix.target }} - ${{ matrix.bundle }} - ${{ matrix.build-system }}
     # Release Cargo artifacts only while Bazel releases are disabled.
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && 'macos-15' || matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     # Official releases use the protected bazel environment and Azure Key Vault
     # signing. Fork builds are manual, ad-hoc signed, and do not publish.
     # environment:
@@ -102,63 +100,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build-system: [cargo] # Bazel releases are disabled while the BuildBuddy key is revoked.
-        target:
-          - aarch64-apple-darwin
-          - x86_64-apple-darwin
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-        bundle: [primary, app-server]
         include:
-          - runner: macos-15-xlarge
+          - runner: macos-15
             target: aarch64-apple-darwin
             bundle: primary
+            build-system: cargo
             artifact_name: aarch64-apple-darwin
             binaries: "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy"
             build_dmg: "true"
-          - runner: macos-15-xlarge
-            target: aarch64-apple-darwin
-            bundle: app-server
-            artifact_name: aarch64-apple-darwin-app-server
-            binaries: "codex-app-server codex-code-mode-host codex-exec-server"
-            build_dmg: "false"
-          - runner: macos-15-xlarge
-            target: x86_64-apple-darwin
-            bundle: primary
-            artifact_name: x86_64-apple-darwin
-            binaries: "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy"
-            build_dmg: "true"
-          - runner: macos-15-xlarge
-            target: x86_64-apple-darwin
-            bundle: app-server
-            artifact_name: x86_64-apple-darwin-app-server
-            binaries: "codex-app-server codex-code-mode-host codex-exec-server"
-            build_dmg: "false"
-          # Release artifacts intentionally ship MUSL-linked Linux binaries.
-          - runner: ${{ github.event.repository.name }}-linux-x64-xl
-            target: x86_64-unknown-linux-musl
-            bundle: primary
-            artifact_name: x86_64-unknown-linux-musl
-            binaries: "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy bwrap"
-            build_dmg: "false"
-          - runner: ${{ github.event.repository.name }}-linux-x64-xl
-            target: x86_64-unknown-linux-musl
-            bundle: app-server
-            artifact_name: x86_64-unknown-linux-musl-app-server
-            binaries: "codex-app-server codex-code-mode-host codex-exec-server"
-            build_dmg: "false"
-          - runner: ${{ github.event.repository.name }}-linux-arm64
-            target: aarch64-unknown-linux-musl
-            bundle: primary
-            artifact_name: aarch64-unknown-linux-musl
-            binaries: "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy bwrap"
-            build_dmg: "false"
-          - runner: ${{ github.event.repository.name }}-linux-arm64
-            target: aarch64-unknown-linux-musl
-            bundle: app-server
-            artifact_name: aarch64-unknown-linux-musl-app-server
-            binaries: "codex-app-server codex-code-mode-host codex-exec-server"
-            build_dmg: "false"
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
