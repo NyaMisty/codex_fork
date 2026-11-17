@@ -2,6 +2,11 @@ name: rust-release-windows
 
 on:
   workflow_call:
+    inputs:
+      matrix:
+        description: JSON matrix of Windows targets to build.
+        required: true
+        type: string
 
 env:
   WINDOWS_BINARIES: "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy codex-windows-sandbox-setup codex-windows-sandbox-service codex-command-runner codex-app-server"
@@ -10,13 +15,12 @@ jobs:
   build-windows-binaries:
     name: Build Windows binaries - ${{ matrix.runner }} - ${{ matrix.target }} - ${{ matrix.bundle }} - ${{ matrix.build-system }}
     # Release Cargo artifacts only while Bazel releases are disabled.
-    runs-on: ${{ matrix.runs_on }}
-    environment:
-      name: bazel
-      deployment: false
-    # Temporary increase from 90 minutes while Cargo and Bazel build paths coexist.
-    # Reassess after the transition using Bazel release build timings.
-    timeout-minutes: 120
+    runs-on: ${{ matrix.runner }}
+    # Fork builds use hosted Windows runners and do not use the bazel environment.
+    # environment:
+    #   name: bazel
+    #   deployment: false
+    timeout-minutes: 300
     permissions:
       contents: read
     defaults:
@@ -25,58 +29,13 @@ jobs:
     env:
       # Preserve Cargo names while teams opt into the additional Bazel artifacts.
       ARTIFACT_SUFFIX: ${{ matrix.build-system == 'bazel' && '-bazel' || '' }}
+      # Fork build policy: disable LTO, keep symbols (no strip).
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_STRIP: "false"
 
     strategy:
       fail-fast: false
-      matrix:
-        build-system: [cargo] # Bazel releases are disabled while the BuildBuddy key is revoked.
-        target:
-          - x86_64-pc-windows-msvc
-          - aarch64-pc-windows-msvc
-        bundle: [primary, helpers, app-server]
-        include:
-          - runner: windows-x64
-            target: x86_64-pc-windows-msvc
-            bundle: primary
-            binaries: "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy"
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
-          - runner: windows-arm64
-            target: aarch64-pc-windows-msvc
-            bundle: primary
-            binaries: "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy"
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-arm64
-          - runner: windows-x64
-            target: x86_64-pc-windows-msvc
-            bundle: helpers
-            binaries: "codex-windows-sandbox-setup codex-windows-sandbox-service codex-command-runner"
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
-          - runner: windows-arm64
-            target: aarch64-pc-windows-msvc
-            bundle: helpers
-            binaries: "codex-windows-sandbox-setup codex-windows-sandbox-service codex-command-runner"
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-arm64
-          - runner: windows-x64
-            target: x86_64-pc-windows-msvc
-            bundle: app-server
-            binaries: "codex-app-server codex-code-mode-host codex-exec-server"
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
-          - runner: windows-arm64
-            target: aarch64-pc-windows-msvc
-            bundle: app-server
-            binaries: "codex-app-server codex-code-mode-host codex-exec-server"
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-arm64
+      matrix: ${{ fromJSON(inputs.matrix) }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -176,6 +135,7 @@ jobs:
             ${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/staged-${{ matrix.bundle }}/*
 
   build-windows-voice:
+    if: github.event_name != 'workflow_dispatch'
     name: Build Windows voice - ${{ matrix.target }}
     runs-on: ${{ matrix.runs_on }}
     environment:
@@ -308,6 +268,7 @@ jobs:
   build-windows-symbols:
     needs:
       - build-windows-binaries
+    if: github.event_name != 'workflow_dispatch'
     name: Build Windows symbols - ${{ matrix.target }} - ${{ matrix.build-system }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -368,6 +329,7 @@ jobs:
     needs:
       - build-windows-binaries
       - build-windows-voice
+    if: github.event_name != 'workflow_dispatch'
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }} - ${{ matrix.build-system }}
     runs-on: ${{ matrix.runs_on }}
     environment:

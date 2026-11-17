@@ -15,6 +15,31 @@ on:
   #   tags:
   #     - "rust-v*.*.*"
   workflow_dispatch:
+    inputs:
+      aarch64_apple_darwin:
+        description: "macOS arm64 (aarch64-apple-darwin)"
+        type: boolean
+        default: true
+      x86_64_apple_darwin:
+        description: "macOS x86_64 (x86_64-apple-darwin)"
+        type: boolean
+        default: false
+      x86_64_unknown_linux_musl:
+        description: "Linux x86_64 musl (x86_64-unknown-linux-musl)"
+        type: boolean
+        default: true
+      aarch64_unknown_linux_musl:
+        description: "Linux arm64 musl (aarch64-unknown-linux-musl)"
+        type: boolean
+        default: false
+      x86_64_pc_windows_msvc:
+        description: "Windows x86_64 (x86_64-pc-windows-msvc)"
+        type: boolean
+        default: true
+      aarch64_pc_windows_msvc:
+        description: "Windows arm64 (aarch64-pc-windows-msvc)"
+        type: boolean
+        default: false
 
 env:
   CODEX_REPO_ROOT: ${{ github.workspace }}
@@ -68,8 +93,104 @@ jobs:
             || { echo "❌ Manual builds only run from build/macos-arm64-cyber-net-error"; exit 1; }
           echo "✅ Manual fork build from ${GITHUB_REF}"
 
-  build:
+  build-matrix:
     needs: tag-check
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.matrix.outputs.include }}
+      has_native: ${{ steps.matrix.outputs.has_native }}
+      windows_include: ${{ steps.matrix.outputs.windows_include }}
+    steps:
+      - name: Select build matrix
+        id: matrix
+        shell: bash
+        env:
+          AARCH64_APPLE_DARWIN: ${{ inputs.aarch64_apple_darwin || github.event_name != 'workflow_dispatch' }}
+          X86_64_APPLE_DARWIN: ${{ inputs.x86_64_apple_darwin || github.event_name != 'workflow_dispatch' }}
+          X86_64_UNKNOWN_LINUX_MUSL: ${{ inputs.x86_64_unknown_linux_musl || github.event_name != 'workflow_dispatch' }}
+          AARCH64_UNKNOWN_LINUX_MUSL: ${{ inputs.aarch64_unknown_linux_musl || github.event_name != 'workflow_dispatch' }}
+          X86_64_PC_WINDOWS_MSVC: ${{ inputs.x86_64_pc_windows_msvc || github.event_name != 'workflow_dispatch' }}
+          AARCH64_PC_WINDOWS_MSVC: ${{ inputs.aarch64_pc_windows_msvc || github.event_name != 'workflow_dispatch' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          native = []
+          windows = []
+
+          def add_native(target, runner, binaries):
+              native.append({
+                  "runner": runner,
+                  "target": target,
+                  "bundle": "primary",
+                  "build-system": "cargo",
+                  "artifact_name": target,
+                  "binaries": binaries,
+                  "build_dmg": "true" if "apple-darwin" in target else "false",
+              })
+
+          def add_windows(target, runner):
+              windows.append({
+                  "runner": runner,
+                  "target": target,
+                  "bundle": "primary",
+                  "build-system": "cargo",
+                  "binaries": "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy",
+              })
+
+          if os.environ["AARCH64_APPLE_DARWIN"] == "true":
+              add_native(
+                  "aarch64-apple-darwin",
+                  "macos-15",
+                  "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy",
+              )
+          if os.environ["X86_64_APPLE_DARWIN"] == "true":
+              add_native(
+                  "x86_64-apple-darwin",
+                  "macos-15",
+                  "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy",
+              )
+          if os.environ["X86_64_UNKNOWN_LINUX_MUSL"] == "true":
+              add_native(
+                  "x86_64-unknown-linux-musl",
+                  "ubuntu-24.04",
+                  "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy bwrap",
+              )
+          if os.environ["AARCH64_UNKNOWN_LINUX_MUSL"] == "true":
+              add_native(
+                  "aarch64-unknown-linux-musl",
+                  "ubuntu-24.04-arm",
+                  "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy bwrap",
+              )
+          if os.environ["X86_64_PC_WINDOWS_MSVC"] == "true":
+              add_windows("x86_64-pc-windows-msvc", "windows-2025")
+          if os.environ["AARCH64_PC_WINDOWS_MSVC"] == "true":
+              add_windows("aarch64-pc-windows-msvc", "windows-11-arm")
+
+          if not native and not windows:
+              raise SystemExit("Select at least one target")
+
+          Path("native.json").write_text(json.dumps({"include": native}))
+          Path("windows.json").write_text(json.dumps({"include": windows}) if windows else "")
+          print(f"native={len(native)} windows={len(windows)}")
+          PY
+          echo "include=$(cat native.json)" >> "$GITHUB_OUTPUT"
+          if [ -s windows.json ]; then
+            echo "windows_include=$(cat windows.json)" >> "$GITHUB_OUTPUT"
+          else
+            echo "windows_include=" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$(python3 -c 'import json; print(len(json.load(open("native.json"))["include"]))')" -gt 0 ]; then
+            echo "has_native=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_native=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: [tag-check, build-matrix]
+    if: needs.build-matrix.outputs.has_native == 'true'
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }} - ${{ matrix.bundle }} - ${{ matrix.build-system }}
     # Release Cargo artifacts only while Bazel releases are disabled.
     runs-on: ${{ matrix.runner }}
@@ -99,15 +220,7 @@ jobs:
 
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            bundle: primary
-            build-system: cargo
-            artifact_name: aarch64-apple-darwin
-            binaries: "codex codex-code-mode-host codex-exec-server codex-responses-api-proxy"
-            build_dmg: "true"
+      matrix: ${{ fromJSON(needs.build-matrix.outputs.include) }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -155,6 +268,19 @@ jobs:
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
           sudo rm -rf /Library/Developer/CoreSimulator/Caches/* || true
           rm -rf ~/Library/Developer/Xcode/DerivedData/* || true
+          df -h /
+      - name: Free Linux disk space
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The hosted Ubuntu image spends a lot of space on mobile and
+          # language SDKs that this build does not use.
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
           df -h /
       - name: Install Linux bwrap build dependencies
         if: ${{ runner.os == 'Linux' }}
@@ -318,7 +444,7 @@ jobs:
           if-no-files-found: error
 
       - name: Build Linux voice runtime
-        if: ${{ matrix.bundle == 'primary' && contains(matrix.target, 'linux') }}
+        if: ${{ github.event_name != 'workflow_dispatch' && matrix.bundle == 'primary' && contains(matrix.target, 'linux') }}
         shell: bash
         env:
           APP_TARGET: ${{ matrix.target }}
@@ -378,7 +504,7 @@ jobs:
           path: codex-rs/unsigned-dist/${{ matrix.target }}/*
           if-no-files-found: error
 
-      - if: ${{ contains(matrix.target, 'linux') }}
+      - if: ${{ github.event_name != 'workflow_dispatch' && contains(matrix.target, 'linux') }}
         name: Cosign Linux artifacts
         uses: ./.github/actions/linux-code-sign
         with:
@@ -419,7 +545,7 @@ jobs:
         run: |
           set -euo pipefail
           voice_args=()
-          if [[ "$BUNDLE" == "primary" && "$TARGET" == *-unknown-linux-musl ]]; then
+          if [[ "$BUNDLE" == "primary" && "$TARGET" == *-unknown-linux-musl && "${{ github.event_name }}" != "workflow_dispatch" ]]; then
             voice_args+=(--voice-release-dir "${RUNNER_TEMP}/signed-voice/${TARGET}")
             voice_args+=(--release-version "${GITHUB_REF_NAME#rust-v}")
           fi
@@ -439,13 +565,13 @@ jobs:
           binaries: codex-package-${{ matrix.target }}.tar.gz codex-package-${{ matrix.target }}.tar.zst
 
       - name: Set up Python release tools
-        if: ${{ matrix.build-system == 'cargo' && matrix.bundle == 'primary' && runner.os != 'macOS' }}
+        if: ${{ github.event_name != 'workflow_dispatch' && matrix.build-system == 'cargo' && matrix.bundle == 'primary' && runner.os != 'macOS' }}
         uses: ./.github/actions/setup-python-release-tools
         with:
           group: runtime
 
       - name: Build Python runtime wheel
-        if: ${{ matrix.build-system == 'cargo' && matrix.bundle == 'primary' && runner.os != 'macOS' }}
+        if: ${{ github.event_name != 'workflow_dispatch' && matrix.build-system == 'cargo' && matrix.bundle == 'primary' && runner.os != 'macOS' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -501,7 +627,7 @@ jobs:
             --python "${RUNNER_TEMP}/python-runtime-build-venv" --wheel --out-dir "$wheel_dir" "$stage_dir"
 
       - name: Upload Python runtime wheel
-        if: ${{ matrix.build-system == 'cargo' && matrix.bundle == 'primary' && runner.os != 'macOS' }}
+        if: ${{ github.event_name != 'workflow_dispatch' && matrix.build-system == 'cargo' && matrix.bundle == 'primary' && runner.os != 'macOS' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: python-runtime-wheel-${{ matrix.target }}
@@ -566,7 +692,7 @@ jobs:
             codex-rs/dist/${{ matrix.target }}/*
 
       - name: Package ad-hoc macOS artifact
-        if: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' }}
+        if: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' && matrix.bundle == 'primary' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -583,19 +709,19 @@ jobs:
             cargo --version
             sw_vers
           } > "${package_dir}/BUILD_INFO.txt"
-          tar -C "${package_dir}" -czf "${RUNNER_TEMP}/codex-aarch64-apple-darwin.tar.gz" \
+          tar -C "${package_dir}" -czf "${RUNNER_TEMP}/codex-${target}.tar.gz" \
             ${{ matrix.binaries }} BUILD_INFO.txt
-          shasum -a 256 "${RUNNER_TEMP}/codex-aarch64-apple-darwin.tar.gz" \
+          shasum -a 256 "${RUNNER_TEMP}/codex-${target}.tar.gz" \
             | tee "${RUNNER_TEMP}/SHA256SUMS"
           ls -lh "${RUNNER_TEMP}" "${package_dir}"
 
       - name: Upload ad-hoc macOS artifact
-        if: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' }}
+        if: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' && matrix.bundle == 'primary' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: codex-aarch64-apple-darwin
+          name: codex-${{ matrix.target }}
           path: |
-            ${{ runner.temp }}/codex-aarch64-apple-darwin.tar.gz
+            ${{ runner.temp }}/codex-${{ matrix.target }}.tar.gz
             ${{ runner.temp }}/SHA256SUMS
           if-no-files-found: error
 
@@ -1576,9 +1702,11 @@ jobs:
     secrets: inherit
 
   build-windows:
-    needs: tag-check
-    if: github.event_name != 'workflow_dispatch'
+    needs: [tag-check, build-matrix]
+    if: ${{ github.event_name != 'workflow_dispatch' || needs.build-matrix.outputs.windows_include != '' }}
     uses: ./.github/workflows/rust-release-windows.yml
+    with:
+      matrix: ${{ needs.build-matrix.outputs.windows_include }}
     secrets: inherit
 
   argument-comment-lint-release-assets:
