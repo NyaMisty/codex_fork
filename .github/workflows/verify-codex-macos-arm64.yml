@@ -20,17 +20,20 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: codex-aarch64-apple-darwin
-          run-id: 43909888083
+          run-id: 44011927445
           github-token: ${{ github.token }}
           path: artifact
 
-      - name: Verify signature and version
+      - name: Verify signatures and versions
         run: |
           cd artifact
           tar xzf codex-aarch64-apple-darwin.tar.gz
-          file codex
-          codesign --verify --verbose=2 codex
+          for binary in codex codex-code-mode-host codex-exec-server codex-responses-api-proxy; do
+            file "$binary"
+            codesign --verify --verbose=2 "$binary"
+          done
           ./codex --version
+          ./codex-code-mode-host --help >/dev/null
 
       - name: Start cyber-policy mock server
         run: |
