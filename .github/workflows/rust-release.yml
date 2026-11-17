@@ -526,7 +526,7 @@ jobs:
               continue
             fi
             cp "target/${{ matrix.target }}/release/${binary}" "$dest/${binary}-${{ matrix.target }}"
-            if [[ "${{ matrix.target }}" == *linux* ]]; then
+            if [[ "${{ matrix.target }}" == *linux* && "${{ github.event_name }}" != "workflow_dispatch" ]]; then
               cp "target/${{ matrix.target }}/release/${binary}.sigstore" \
                 "$dest/${binary}-${{ matrix.target }}.sigstore"
             fi
