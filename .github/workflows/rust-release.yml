@@ -10,9 +10,11 @@
 
 name: rust-release
 on:
-  push:
-    tags:
-      - "rust-v*.*.*"
+  # Fork builds are manual only. Tag releases stay disabled.
+  # push:
+  #   tags:
+  #     - "rust-v*.*.*"
+  workflow_dispatch:
 
 env:
   CODEX_REPO_ROOT: ${{ github.workspace }}
@@ -32,6 +34,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - name: Validate tag matches Cargo.toml version
+        if: github.event_name != 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail
@@ -56,16 +59,29 @@ jobs:
           echo "✅  Tag and Cargo.toml agree (${tag_ver})"
           echo "::endgroup::"
 
+      - name: Validate manual fork build branch
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF}" == "refs/heads/build/macos-arm64-cyber-net-error" ]] \
+            || { echo "❌ Manual builds only run from build/macos-arm64-cyber-net-error"; exit 1; }
+          echo "✅ Manual fork build from ${GITHUB_REF}"
+
   build:
     needs: tag-check
-    name: Build - ${{ matrix.runner }} - ${{ matrix.target }} - ${{ matrix.bundle }} - ${{ matrix.build-system }}
+    # Manual fork runs build only the macOS arm64 primary bundle.
+    if: ${{ github.event_name != 'workflow_dispatch' || (matrix.target == 'aarch64-apple-darwin' && matrix.bundle == 'primary' && matrix.build-system == 'cargo') }}
+    name: Build - ${{ github.event_name == 'workflow_dispatch' && 'macos-15' || matrix.runner }} - ${{ matrix.target }} - ${{ matrix.bundle }} - ${{ matrix.build-system }}
     # Release Cargo artifacts only while Bazel releases are disabled.
-    runs-on: ${{ matrix.runner }}
-    environment:
-      name: bazel
-      deployment: false
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && 'macos-15' || matrix.runner }}
+    # Official releases use the protected bazel environment and Azure Key Vault
+    # signing. Fork builds are manual, ad-hoc signed, and do not publish.
+    # environment:
+    #   name: bazel
+    #   deployment: false
     # Linux releases also build the native voice runtime in this job.
-    timeout-minutes: 120
+    timeout-minutes: 300
     permissions:
       contents: read
       id-token: write
@@ -79,6 +95,9 @@ jobs:
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'apple-darwin') && 'packed' || 'off' }}
       # The git CLI reliably fetches nested native-library submodules on macOS.
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      # Fork build policy: disable LTO, keep symbols (no strip).
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_STRIP: "false"
 
     strategy:
       fail-fast: false
@@ -174,6 +193,20 @@ jobs:
           echo "Total RAM: ${total_ram}"
           echo "Disk usage:"
           df -h .
+      - name: Free macOS disk space
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Mobile SDKs and simulator runtimes are not needed for this build.
+          # Removing them frees roughly 223 GB for the V8 archive and build.
+          sudo rm -rf /System/Volumes/Data/Users/runner/Library/Android || true
+          sudo rm -rf /System/Volumes/Data/Library/Developer/CoreSimulator || true
+          sudo rm -rf /System/Volumes/Data/System/Library/AssetsV2/com_apple_MobileAsset*SimulatorRuntime || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Caches/* || true
+          rm -rf ~/Library/Developer/Xcode/DerivedData/* || true
+          df -h /
       - name: Install Linux bwrap build dependencies
         if: ${{ runner.os == 'Linux' }}
         shell: bash
@@ -267,6 +300,18 @@ jobs:
           export STABLE_GIT_COMMIT
           cargo build --target "$target" --release --timings "${build_args[@]}"
 
+      - name: Ad-hoc sign macOS binaries
+        if: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for binary in ${{ matrix.binaries }}; do
+            binary_path="target/${{ matrix.target }}/release/${binary}"
+            file "${binary_path}"
+            codesign --force --sign - "${binary_path}"
+            codesign --verify --verbose=2 "${binary_path}"
+          done
+
       - name: Prepare Bazel for release binaries or Linux voice
         if: matrix.build-system == 'bazel' || (matrix.bundle == 'primary' && contains(matrix.target, 'linux'))
         uses: ./.github/actions/prepare-bazel-ci
@@ -285,6 +330,7 @@ jobs:
           release-dir: ${{ github.workspace }}/codex-rs/target/${{ matrix.target }}/release
 
       - name: Build symbols archive and strip binaries
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         shell: bash
         run: |
           binaries=()
@@ -315,6 +361,7 @@ jobs:
           done
 
       - name: Upload symbols archive
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: ${{ matrix.artifact_name }}-symbols${{ env.ARTIFACT_SUFFIX }}
@@ -569,8 +616,43 @@ jobs:
           path: |
             codex-rs/dist/${{ matrix.target }}/*
 
+      - name: Package ad-hoc macOS artifact
+        if: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          release_dir="target/${target}/release"
+          package_dir="${RUNNER_TEMP}/codex-package"
+          mkdir -p "${package_dir}"
+          for binary in ${{ matrix.binaries }}; do
+            cp "${release_dir}/${binary}" "${package_dir}/${binary}"
+          done
+          {
+            echo "commit=${GITHUB_SHA}"
+            rustc --version
+            cargo --version
+            sw_vers
+          } > "${package_dir}/BUILD_INFO.txt"
+          tar -C "${package_dir}" -czf "${RUNNER_TEMP}/codex-aarch64-apple-darwin.tar.gz" \
+            ${{ matrix.binaries }} BUILD_INFO.txt
+          shasum -a 256 "${RUNNER_TEMP}/codex-aarch64-apple-darwin.tar.gz" \
+            | tee "${RUNNER_TEMP}/SHA256SUMS"
+          ls -lh "${RUNNER_TEMP}" "${package_dir}"
+
+      - name: Upload ad-hoc macOS artifact
+        if: ${{ runner.os == 'macOS' && github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-aarch64-apple-darwin
+          path: |
+            ${{ runner.temp }}/codex-aarch64-apple-darwin.tar.gz
+            ${{ runner.temp }}/SHA256SUMS
+          if-no-files-found: error
+
   build-macos-voice:
     needs: tag-check
+    if: github.event_name != 'workflow_dispatch'
     name: Build voice runtime - ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     environment:
@@ -1546,12 +1628,14 @@ jobs:
 
   build-windows:
     needs: tag-check
+    if: github.event_name != 'workflow_dispatch'
     uses: ./.github/workflows/rust-release-windows.yml
     secrets: inherit
 
   argument-comment-lint-release-assets:
     name: argument-comment-lint release assets
     needs: tag-check
+    if: github.event_name != 'workflow_dispatch'
     uses: ./.github/workflows/rust-release-argument-comment-lint.yml
     with:
       publish: true
