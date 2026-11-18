@@ -1,4 +1,5 @@
 use super::*;
+use crate::McpRefreshReason;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::agents_md_manager::SessionInstructions;
 use crate::session::Submission;
@@ -360,6 +361,10 @@ impl GatedModelsManager {
 }
 
 impl ModelsManager for GatedModelsManager {
+    fn ensure_initialized(&self, factory: HttpClientFactory) -> ModelsManagerFuture<'_, ()> {
+        self.inner.ensure_initialized(factory)
+    }
+
     fn model_catalog_with_origins(
         &self,
         strategy: RefreshStrategy,
@@ -608,7 +613,7 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         .acquire()
         .await
         .expect("MCP refresh lock");
-    session.mark_mcp_runtime_dirty();
+    session.mark_mcp_runtime_dirty(McpRefreshReason::ExplicitInvalidation);
     let capture_cancel = CancellationToken::new();
     let mut during = Box::pin(tokio::task::unconstrained(
         session.capture_step_context(Arc::clone(&turn), &capture_cancel),
@@ -1066,6 +1071,7 @@ async fn activation_must_match_the_retained_turn_authority(change: ManagedPolicy
     });
     assert!(
         !turn
+            .permission_profile()
             .file_system_sandbox_policy()
             .has_full_disk_write_access()
     );
@@ -1095,6 +1101,7 @@ async fn activation_must_match_the_retained_turn_authority(change: ManagedPolicy
             current,
             &destination,
             &live.original_config_do_not_use,
+            false,
         ),
         Ok(())
     );
@@ -1154,6 +1161,7 @@ async fn activation_must_match_the_retained_turn_authority(change: ManagedPolicy
             current,
             &destination,
             &live.original_config_do_not_use,
+            false,
         ),
         Err(match change {
             ManagedPolicyChange::RequireReview => {
@@ -1237,7 +1245,14 @@ async fn model_safety_changes_must_match_the_admitted_authority(
     }
     for current in [&admitted, &destination] {
         assert_eq!(
-            check_legacy_model_safety(&admitted, current, &destination, &turn.config, &turn.config,),
+            check_legacy_model_safety(
+                &admitted,
+                current,
+                &destination,
+                &turn.config,
+                &turn.config,
+                false,
+            ),
             Err(reason.to_string())
         );
     }
@@ -1270,7 +1285,7 @@ async fn model_safety_rejects_fallback_metadata() {
         ),
     ] {
         assert_eq!(
-            check_legacy_model_safety(old, current, next, &turn.config, &turn.config),
+            check_legacy_model_safety(old, current, next, &turn.config, &turn.config, false,),
             Err(reason.to_string())
         );
     }
@@ -1301,6 +1316,7 @@ async fn parent_fallback_policy_uses_both_config_lifetimes(
             &destination,
             &admitted_config,
             &live_config,
+            false,
         ),
         if allowed {
             Ok(())
@@ -1318,7 +1334,7 @@ async fn parent_fallback_preserves_explicit_empty_and_bundled_defaults() {
     config.guardian_policy_config = None;
     let (admitted, mut destination) = safety_models();
     let check = |destination: &CatalogModel| {
-        check_legacy_model_safety(&admitted, &admitted, destination, &config, &config)
+        check_legacy_model_safety(&admitted, &admitted, destination, &config, &config, false)
     };
     parent_review_messages(&mut destination).policy = Some(defaults.policy.to_string());
     parent_review_messages(&mut destination).policy_template =
@@ -1362,6 +1378,7 @@ async fn unchanged_explicit_reviewer_does_not_use_parent_policy() {
             &destination,
             &turn.config,
             &turn.config,
+            false,
         ),
         Ok(())
     );
@@ -1431,7 +1448,14 @@ async fn guardian_v2_classification_settings_match_the_admitted_authority(
         destination.auto_review_model_override = reviewer_override;
         for current in [&admitted, &destination] {
             assert_eq!(
-                check_legacy_model_safety(&admitted, current, &destination, &config, &config,),
+                check_legacy_model_safety(
+                    &admitted,
+                    current,
+                    &destination,
+                    &config,
+                    &config,
+                    false,
+                ),
                 Err(
                     "the destination changes the admitted Guardian V2 classification settings"
                         .to_string()
@@ -1482,6 +1506,7 @@ async fn inactive_guardian_v2_does_not_restrict_model_defaults(
             &destination,
             &admitted_config,
             &live_config,
+            false,
         ),
         Ok(())
     );
@@ -1531,7 +1556,14 @@ async fn guardian_v2_empty_or_legacy_model_defaults_are_equivalent(
             .guardian_v2 = Some(settings);
         for current in [&admitted, &destination] {
             assert_eq!(
-                check_legacy_model_safety(&admitted, current, &destination, &config, &config,),
+                check_legacy_model_safety(
+                    &admitted,
+                    current,
+                    &destination,
+                    &config,
+                    &config,
+                    false,
+                ),
                 Ok(())
             );
         }
