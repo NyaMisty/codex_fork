@@ -1,0 +1,28 @@
+name: test-token-permissions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Probe token permissions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          echo "repo=${GITHUB_REPOSITORY} sha=${GITHUB_SHA}"
+          echo "--- read tag ref ---"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/token-test-does-not-exist" 2>&1 || true
+          echo "--- create tag ref ---"
+          test_tag="token-test-$(date +%s)"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/${test_tag}" \
+            -f sha="${GITHUB_SHA}" 2>&1 || true
+          echo "test_tag=${test_tag}"
+          echo "--- delete tag ref ---"
+          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${test_tag}" 2>&1 || true
