@@ -7,29 +7,32 @@ on:
   workflow_dispatch:
 
 jobs:
-  annotated-tag-probe:
+  test:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
-      - name: Probe annotated tag creation
+      - name: Probe release API with existing tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -u
-          tag="token-test-annotated-$(date +%s)"
-          echo "tag=${tag}"
-          echo "--- create tag object ---"
-          tag_obj="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/git/tags" \
-            -f tag="$tag" \
-            -f message="temporary annotated tag probe" \
-            -f object="${GITHUB_SHA}" \
-            -f type=commit --jq .sha 2>&1)" || true
-          echo "tag_obj=${tag_obj}"
-          echo "--- create tag ref ---"
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref="refs/tags/${tag}" -f sha="${tag_obj}" 2>&1 || true
-          echo "ref create exit=$?"
-          echo "--- delete tag ref ---"
-          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" 2>&1 || true
-          echo "ref delete exit=$?"
+          tag=token-test-existing-20261122
+
+          echo "--- create release for existing tag ---"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$tag" \
+            --notes "temporary token permission probe" 2>&1 || true
+          echo "release create exit=$?"
+
+          echo "--- upload asset ---"
+          printf 'probe\n' > /tmp/probe-asset.txt
+          gh release upload "$tag" /tmp/probe-asset.txt --repo "$GITHUB_REPOSITORY" --clobber 2>&1 || true
+          echo "upload exit=$?"
+
+          echo "--- delete release ---"
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes 2>&1 || true
+          echo "release delete exit=$?"
