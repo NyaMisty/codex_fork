@@ -7,6 +7,8 @@
 #
 # Tag releases sign macOS binaries and DMGs through the protected `codesigning`
 # GitHub environment and Azure Key Vault before final verification on macOS.
+# Manual fork builds can optionally publish their artifacts to a GitHub Release
+# by setting the release_tag workflow_dispatch input.
 
 name: rust-release
 on:
@@ -40,6 +42,11 @@ on:
         description: "Windows arm64 (aarch64-pc-windows-msvc)"
         type: boolean
         default: false
+      release_tag:
+        description: "Publish built artifacts to this GitHub Release tag (leave empty to skip)"
+        type: string
+        required: false
+        default: ""
 
 env:
   CODEX_REPO_ROOT: ${{ github.workspace }}
@@ -711,8 +718,8 @@ jobs:
           } > "${package_dir}/BUILD_INFO.txt"
           tar -C "${package_dir}" -czf "${RUNNER_TEMP}/codex-${target}.tar.gz" \
             ${{ matrix.binaries }} BUILD_INFO.txt
-          shasum -a 256 "${RUNNER_TEMP}/codex-${target}.tar.gz" \
-            | tee "${RUNNER_TEMP}/SHA256SUMS"
+          (cd "${RUNNER_TEMP}" && shasum -a 256 "codex-${target}.tar.gz" > SHA256SUMS)
+          cat "${RUNNER_TEMP}/SHA256SUMS"
           ls -lh "${RUNNER_TEMP}" "${package_dir}"
 
       - name: Upload ad-hoc macOS artifact
@@ -1710,6 +1717,169 @@ jobs:
     with:
       matrix: ${{ needs.build-matrix.outputs.windows_include }}
     secrets: inherit
+
+  publish-manual-release:
+    name: Publish manual release
+    needs: [tag-check, build-matrix, build, build-windows]
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.release_tag != '' &&
+        (needs.build.result == 'success' ||
+          (needs.build.result == 'skipped' && needs.build-matrix.outputs.has_native == 'false')) &&
+        (needs.build-windows.result == 'success' ||
+          (needs.build-windows.result == 'skipped' && needs.build-matrix.outputs.windows_include == '')) &&
+        (needs.build.result == 'success' || needs.build-windows.result == 'success')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: manual-release-publication
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Validate release tag
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "Invalid release tag: '$RELEASE_TAG'"
+            exit 1
+          fi
+          echo "Publishing to release tag: $RELEASE_TAG"
+
+      - name: Download build artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_JSON: ${{ needs.build-matrix.outputs.include }}
+          WINDOWS_JSON: ${{ needs.build-matrix.outputs.windows_include }}
+        run: |
+          set -euo pipefail
+          release_dir="$PWD/release-assets"
+          mkdir -p downloads "$release_dir"
+
+          python3 - "$NATIVE_JSON" "$WINDOWS_JSON" > targets.txt <<'PY'
+          import json
+          import sys
+
+          for kind, raw in (("native", sys.argv[1]), ("windows", sys.argv[2])):
+              if not raw.strip():
+                  continue
+              for item in json.loads(raw).get("include", []):
+                  print(kind, item["target"])
+          PY
+
+          while read -r kind target; do
+            case "$kind" in
+              native)
+                if [[ "$target" == *apple-darwin ]]; then
+                  artifact="codex-${target}"
+                else
+                  artifact="$target"
+                fi
+                ;;
+              windows)
+                artifact="windows-binaries-${target}-primary"
+                ;;
+            esac
+            echo "Downloading ${artifact}"
+            gh run download "$GITHUB_RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name "$artifact" \
+              --dir "downloads/${kind}-${target}"
+          done < targets.txt
+
+          while read -r kind target; do
+            case "$kind" in
+              native)
+                if [[ "$target" == *apple-darwin ]]; then
+                  archive="downloads/${kind}-${target}/codex-${target}.tar.gz"
+                  if [[ ! -f "$archive" ]]; then
+                    echo "Missing ${archive}"
+                    exit 1
+                  fi
+                  cp "$archive" "$release_dir/"
+                else
+                  found=0
+                  while IFS= read -r -d '' archive; do
+                    cp "$archive" "$release_dir/"
+                    found=1
+                  done < <(find "downloads/${kind}-${target}" -type f \
+                    \( -name '*.tar.gz' -o -name '*.tar.zst' \) -print0)
+                  if [[ "$found" -eq 0 ]]; then
+                    echo "No Linux archives for ${target}"
+                    exit 1
+                  fi
+                fi
+                ;;
+              windows)
+                package_dir="$(mktemp -d)"
+                find "downloads/${kind}-${target}" -type f -name '*.exe' \
+                  -exec cp -t "$package_dir" {} +
+                if ! compgen -G "$package_dir/*.exe" > /dev/null; then
+                  echo "No Windows executables for ${target}"
+                  exit 1
+                fi
+                {
+                  echo "commit=${GITHUB_SHA}"
+                  echo "target=${target}"
+                  echo "release_tag=${RELEASE_TAG}"
+                  echo "workflow_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+                } > "$package_dir/BUILD_INFO.txt"
+                (cd "$package_dir" && sha256sum -- *.exe > SHA256SUMS)
+                (cd "$package_dir" && zip -q -r "$release_dir/codex-${target}.zip" .)
+                rm -rf "$package_dir"
+                ;;
+            esac
+          done < targets.txt
+
+          rm -f "$release_dir/SHA256SUMS"
+          (cd "$release_dir" && sha256sum -- * > SHA256SUMS)
+          ls -lh "$release_dir"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" > /dev/null 2>&1; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_TAG}" \
+              -f sha="${GITHUB_SHA}" > /dev/null
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists; replacing matching assets"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --notes "Fork build from commit ${GITHUB_SHA}. Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
+
+          gh release upload "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Summarize release assets
+        run: |
+          {
+            echo "## Manual release: ${RELEASE_TAG}"
+            echo ""
+            echo "| Asset | Size |"
+            echo "| --- | --- |"
+            for asset in release-assets/*; do
+              name="$(basename "$asset")"
+              size="$(du -h "$asset" | cut -f1)"
+              echo "| ${name} | ${size} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
 
   argument-comment-lint-release-assets:
     name: argument-comment-lint release assets
