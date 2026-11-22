@@ -7,36 +7,27 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  push-probe:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: read
     steps:
-      - name: Probe release API with existing tag
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Probe git push tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -u
-          echo "repo=${GITHUB_REPOSITORY} sha=${GITHUB_SHA}"
-          tag=token-test-existing-20261122
-
-          echo "--- create release for existing tag ---"
-          gh release create "$tag" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "$tag" \
-            --notes "temporary token permission probe" 2>&1 || true
-          echo "release create exit=$?"
-
-          echo "--- upload asset ---"
-          printf 'probe\n' > /tmp/probe-asset.txt
-          gh release upload "$tag" /tmp/probe-asset.txt --repo "$GITHUB_REPOSITORY" --clobber 2>&1 || true
-          echo "upload exit=$?"
-
-          echo "--- list release assets ---"
-          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>&1 || true
-
-          echo "--- delete release ---"
-          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes 2>&1 || true
-          echo "release delete exit=$?"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tag="token-test-gitpush-$(date +%s)"
+          git tag "$tag"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          echo "--- push tag ---"
+          git push origin "refs/tags/${tag}" 2>&1 || true
+          echo "tag push exit=$?"
+          echo "--- delete tag ---"
+          git push origin ":refs/tags/${tag}" 2>&1 || true
+          echo "tag delete exit=$?"
