@@ -22,21 +22,26 @@ jobs:
           test_tag="token-test-release-$(date +%s)"
           echo "test_tag=${test_tag}"
 
+          echo "--- create blob ---"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/blobs" \
+            -f content="probe" -f encoding=utf-8 2>&1 || true
+          echo "blob exit=$?"
+
           echo "--- create release with target ---"
           gh release create "$test_tag" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$test_tag" \
-            --notes "temporary token permission probe" 2>&1
+            --notes "temporary token permission probe" 2>&1 || true
           echo "create exit=$?"
 
           echo "--- upload asset ---"
           printf 'probe\n' > /tmp/probe-asset.txt
-          gh release upload "$test_tag" /tmp/probe-asset.txt --repo "$GITHUB_REPOSITORY" 2>&1
+          gh release upload "$test_tag" /tmp/probe-asset.txt --repo "$GITHUB_REPOSITORY" 2>&1 || true
           echo "upload exit=$?"
 
           echo "--- delete release and tag ---"
-          gh release delete "$test_tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>&1
+          gh release delete "$test_tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>&1 || true
           echo "delete exit=$?"
 
 # probe
