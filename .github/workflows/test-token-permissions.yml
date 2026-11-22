@@ -7,27 +7,29 @@ on:
   workflow_dispatch:
 
 jobs:
-  push-probe:
+  annotated-tag-probe:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - name: Probe git push tag
+      - name: Probe annotated tag creation
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -u
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          tag="token-test-gitpush-$(date +%s)"
-          git tag "$tag"
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          echo "--- push tag ---"
-          git push origin "refs/tags/${tag}" 2>&1 || true
-          echo "tag push exit=$?"
-          echo "--- delete tag ---"
-          git push origin ":refs/tags/${tag}" 2>&1 || true
-          echo "tag delete exit=$?"
+          tag="token-test-annotated-$(date +%s)"
+          echo "tag=${tag}"
+          echo "--- create tag object ---"
+          tag_obj="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/git/tags" \
+            -f tag="$tag" \
+            -f message="temporary annotated tag probe" \
+            -f object="${GITHUB_SHA}" \
+            -f type=commit --jq .sha 2>&1)" || true
+          echo "tag_obj=${tag_obj}"
+          echo "--- create tag ref ---"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/${tag}" -f sha="${tag_obj}" 2>&1 || true
+          echo "ref create exit=$?"
+          echo "--- delete tag ref ---"
+          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" 2>&1 || true
+          echo "ref delete exit=$?"
