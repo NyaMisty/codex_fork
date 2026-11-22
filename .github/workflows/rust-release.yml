@@ -7,8 +7,10 @@
 #
 # Tag releases sign macOS binaries and DMGs through the protected `codesigning`
 # GitHub environment and Azure Key Vault before final verification on macOS.
-# Manual fork builds can optionally publish their artifacts to a GitHub Release
-# by setting the release_tag workflow_dispatch input.
+# Manual fork builds can optionally publish their artifacts to an existing
+# GitHub Release tag by setting the release_tag workflow_dispatch input. The tag
+# must be created and pushed before triggering the workflow: GITHUB_TOKEN cannot
+# create tags for commits that introduce workflow changes.
 
 name: rust-release
 on:
@@ -43,7 +45,7 @@ on:
         type: boolean
         default: false
       release_tag:
-        description: "Publish built artifacts to this GitHub Release tag (leave empty to skip)"
+        description: "Publish built artifacts to this existing GitHub Release tag (leave empty to skip)"
         type: string
         required: false
         default: ""
@@ -99,6 +101,25 @@ jobs:
           [[ "${GITHUB_REF}" == "refs/heads/build/macos-arm64-cyber-net-error" ]] \
             || { echo "❌ Manual builds only run from build/macos-arm64-cyber-net-error"; exit 1; }
           echo "✅ Manual fork build from ${GITHUB_REF}"
+
+      - name: Validate manual release tag
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "❌ Invalid release tag: '$RELEASE_TAG'"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" > /dev/null; then
+            echo "❌ Release tag '${RELEASE_TAG}' does not exist or is not accessible."
+            echo "   Create and push the tag before triggering this workflow."
+            exit 1
+          fi
+          echo "✅ Release tag exists: ${RELEASE_TAG}"
 
   build-matrix:
     needs: tag-check
@@ -1744,10 +1765,17 @@ jobs:
       RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
       - name: Validate release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
             echo "Invalid release tag: '$RELEASE_TAG'"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" > /dev/null; then
+            echo "Release tag '${RELEASE_TAG}' does not exist or is not accessible."
+            echo "Create and push the tag before triggering this workflow."
             exit 1
           fi
           echo "Publishing to release tag: $RELEASE_TAG"
@@ -1846,12 +1874,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" > /dev/null 2>&1; then
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/tags/${RELEASE_TAG}" \
-              -f sha="${GITHUB_SHA}" > /dev/null
-          fi
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "Release ${RELEASE_TAG} already exists; replacing matching assets"
