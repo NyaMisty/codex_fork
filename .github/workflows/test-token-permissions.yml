@@ -38,3 +38,5 @@ jobs:
           echo "--- delete release and tag ---"
           gh release delete "$test_tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>&1
           echo "delete exit=$?"
+
+# probe
