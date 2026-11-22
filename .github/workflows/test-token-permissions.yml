@@ -13,35 +13,31 @@ jobs:
       contents: write
       actions: read
     steps:
-      - name: Probe release API
+      - name: Probe ref and release APIs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -u
           echo "repo=${GITHUB_REPOSITORY} sha=${GITHUB_SHA}"
-          test_tag="token-test-release-$(date +%s)"
-          echo "test_tag=${test_tag}"
+          branch="token-test-branch-$(date +%s)"
 
-          echo "--- create blob ---"
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/blobs" \
-            -f content="probe" -f encoding=utf-8 2>&1 || true
-          echo "blob exit=$?"
+          echo "--- create branch ref ---"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/heads/${branch}" -f sha="${GITHUB_SHA}" 2>&1 || true
+          echo "branch create exit=$?"
 
-          echo "--- create release with target ---"
-          gh release create "$test_tag" \
+          echo "--- delete branch ref ---"
+          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${branch}" 2>&1 || true
+          echo "branch delete exit=$?"
+
+          echo "--- create release for existing tag ---"
+          gh release create rust-v0.169.1 \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "$test_tag" \
+            --verify-tag \
+            --title token-test-existing-tag \
             --notes "temporary token permission probe" 2>&1 || true
-          echo "create exit=$?"
+          echo "release create exit=$?"
 
-          echo "--- upload asset ---"
-          printf 'probe\n' > /tmp/probe-asset.txt
-          gh release upload "$test_tag" /tmp/probe-asset.txt --repo "$GITHUB_REPOSITORY" 2>&1 || true
-          echo "upload exit=$?"
-
-          echo "--- delete release and tag ---"
-          gh release delete "$test_tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>&1 || true
-          echo "delete exit=$?"
-
-# probe
+          echo "--- delete existing-tag release ---"
+          gh release delete rust-v0.169.1 --repo "$GITHUB_REPOSITORY" --yes 2>&1 || true
+          echo "release delete exit=$?"
