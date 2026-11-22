@@ -1,6 +1,9 @@
 name: test-token-permissions
 
 on:
+  push:
+    branches:
+      - build/macos-arm64-cyber-net-error
   workflow_dispatch:
 
 jobs:
